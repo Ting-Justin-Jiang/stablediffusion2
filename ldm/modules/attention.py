@@ -7,6 +7,7 @@ from einops import rearrange, repeat
 from typing import Optional, Any
 
 from ldm.modules.diffusionmodules.util import checkpoint
+from torch.profiler import profile, record_function, ProfilerActivity
 
 
 try:
@@ -161,37 +162,38 @@ class CrossAttention(nn.Module):
         )
 
     def forward(self, x, context=None, mask=None):
-        h = self.heads
+        with record_function("0Model: Cross_Attention"):
+            h = self.heads
 
-        q = self.to_q(x)
-        context = default(context, x)
-        k = self.to_k(context)
-        v = self.to_v(context)
+            q = self.to_q(x)
+            context = default(context, x)
+            k = self.to_k(context)
+            v = self.to_v(context)
 
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+            q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
-        # force cast to fp32 to avoid overflowing
-        if _ATTN_PRECISION =="fp32":
-            with torch.autocast(enabled=False, device_type = 'cuda'):
-                q, k = q.float(), k.float()
+            # force cast to fp32 to avoid overflowing
+            if _ATTN_PRECISION =="fp32":
+                with torch.autocast(enabled=False, device_type = 'cuda'):
+                    q, k = q.float(), k.float()
+                    sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
+            else:
                 sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
-        else:
-            sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
-        
-        del q, k
-    
-        if exists(mask):
-            mask = rearrange(mask, 'b ... -> b (...)')
-            max_neg_value = -torch.finfo(sim.dtype).max
-            mask = repeat(mask, 'b j -> (b h) () j', h=h)
-            sim.masked_fill_(~mask, max_neg_value)
 
-        # attention, what we cannot get enough of
-        sim = sim.softmax(dim=-1)
+            del q, k
 
-        out = einsum('b i j, b j d -> b i d', sim, v)
-        out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
-        return self.to_out(out)
+            if exists(mask):
+                mask = rearrange(mask, 'b ... -> b (...)')
+                max_neg_value = -torch.finfo(sim.dtype).max
+                mask = repeat(mask, 'b j -> (b h) () j', h=h)
+                sim.masked_fill_(~mask, max_neg_value)
+
+            # attention, what we cannot get enough of
+            sim = sim.softmax(dim=-1)
+
+            out = einsum('b i j, b j d -> b i d', sim, v)
+            out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+            return self.to_out(out)
 
 
 class MemoryEfficientCrossAttention(nn.Module):
@@ -269,10 +271,11 @@ class BasicTransformerBlock(nn.Module):
         return checkpoint(self._forward, (x, context), self.parameters(), self.checkpoint)
 
     def _forward(self, x, context=None):
-        x = self.attn1(self.norm1(x), context=context if self.disable_self_attn else None) + x
-        x = self.attn2(self.norm2(x), context=context) + x
-        x = self.ff(self.norm3(x)) + x
-        return x
+        with record_function("0Model: Basic_Transformer"):
+            x = self.attn1(self.norm1(x), context=context if self.disable_self_attn else None) + x
+            x = self.attn2(self.norm2(x), context=context) + x
+            x = self.ff(self.norm3(x)) + x
+            return x
 
 
 class SpatialTransformer(nn.Module):
@@ -320,22 +323,30 @@ class SpatialTransformer(nn.Module):
 
     def forward(self, x, context=None):
         # note: if no context is given, cross-attention defaults to self-attention
-        if not isinstance(context, list):
-            context = [context]
-        b, c, h, w = x.shape
-        x_in = x
-        x = self.norm(x)
-        if not self.use_linear:
-            x = self.proj_in(x)
-        x = rearrange(x, 'b c h w -> b (h w) c').contiguous()
-        if self.use_linear:
-            x = self.proj_in(x)
-        for i, block in enumerate(self.transformer_blocks):
-            x = block(x, context=context[i])
-        if self.use_linear:
-            x = self.proj_out(x)
-        x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w).contiguous()
-        if not self.use_linear:
-            x = self.proj_out(x)
-        return x + x_in
+        with record_function("0Model: Spatial_Transformer"):
+            if not isinstance(context, list):
+                context = [context]
+            b, c, h, w = x.shape
+            x_in = x
+            x = self.norm(x)
+
+            if not self.use_linear:
+                with record_function("0Model: Proj_In_CNN"):
+                    x = self.proj_in(x)
+            x = rearrange(x, 'b c h w -> b (h w) c').contiguous()
+            if self.use_linear:
+                with record_function("0Model: Proj_In_CNN"):
+                    x = self.proj_in(x)
+
+            for i, block in enumerate(self.transformer_blocks):
+                x = block(x, context=context[i])
+
+            if self.use_linear:
+                with record_function("0Model: Proj_Out_CNN"):
+                    x = self.proj_out(x)
+            x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w).contiguous()
+            if not self.use_linear:
+                with record_function("0Model: Proj_Out_CNN"):
+                    x = self.proj_out(x)
+            return x + x_in
 

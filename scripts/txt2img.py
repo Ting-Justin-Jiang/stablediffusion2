@@ -221,6 +221,9 @@ def main(opt):
     device = torch.device("cuda") if opt.device == "cuda" else torch.device("cpu")
     model = load_model_from_config(config, f"{opt.ckpt}", device)
 
+    # profiling option
+    custom_record_functions = ["DDIM_Sampling", "UNet_output_blocks", "UNet_input_blocks", "VAE_Decoder",
+                               "UNet_middle_block", "Attention_Block"]
     tome_ratio = 0.5
     tomesd.apply_patch(model, ratio=tome_ratio)
 
@@ -343,27 +346,30 @@ def main(opt):
             all_samples = list()
             for n in trange(opt.n_iter, desc="Sampling"):
                 for prompts in tqdm(data, desc="data"):
-                    uc = None
-                    if opt.scale != 1.0:
-                        uc = model.get_learned_conditioning(batch_size * [""])
-                    if isinstance(prompts, tuple):
-                        prompts = list(prompts)
-                    c = model.get_learned_conditioning(prompts)
-                    shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
-                    samples, _ = sampler.sample(S=opt.steps,
-                                                     conditioning=c,
-                                                     batch_size=opt.n_samples,
-                                                     shape=shape,
-                                                     verbose=False,
-                                                     unconditional_guidance_scale=opt.scale,
-                                                     unconditional_conditioning=uc,
-                                                     eta=opt.ddim_eta,
-                                                     x_T=start_code,
-                                                     tome_ratio=tome_ratio
-                                                )
-
-                    x_samples = model.decode_first_stage(samples)
-                    x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
+                    with profile(activities=[
+                                torch.profiler.ProfilerActivity.CPU,
+                                torch.profiler.ProfilerActivity.CUDA,
+                                ]) as prof:
+                        uc = None
+                        if opt.scale != 1.0:
+                            uc = model.get_learned_conditioning(batch_size * [""])
+                        if isinstance(prompts, tuple):
+                            prompts = list(prompts)
+                        c = model.get_learned_conditioning(prompts)
+                        shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
+                        samples, _ = sampler.sample(S=opt.steps,
+                                                    conditioning=c,
+                                                    batch_size=opt.n_samples,
+                                                    shape=shape,
+                                                    verbose=False,
+                                                    unconditional_guidance_scale=opt.scale,
+                                                    unconditional_conditioning=uc,
+                                                    eta=opt.ddim_eta,
+                                                    x_T=start_code
+                                                    )
+                        with record_function("0Model: VAE_Decoder"):
+                            x_samples = model.decode_first_stage(samples)
+                        x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
 
                     for x_sample in x_samples:
                         x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
@@ -375,6 +381,7 @@ def main(opt):
 
                     all_samples.append(x_samples)
 
+            print(prof.key_averages().table(sort_by="cuda_time_total"))
             # additionally, save as grid
             grid = torch.stack(all_samples, 0)
             grid = rearrange(grid, 'n b c h w -> (n b) c h w')

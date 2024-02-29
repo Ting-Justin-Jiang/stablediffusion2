@@ -77,7 +77,6 @@ class DDIMSampler(object):
                unconditional_conditioning=None, # this has to come in the same format as the conditioning, # e.g. as encoded tokens, ...
                dynamic_threshold=None,
                ucg_schedule=None,
-               tome_ratio=0.0,
                **kwargs
                ):
         if conditioning is not None:
@@ -103,33 +102,26 @@ class DDIMSampler(object):
         size = (batch_size, C, H, W)
         print(f'Data shape for DDIM sampling is {size}, eta {eta}')
 
-        # profiling
-        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                     record_shapes=True,
-                     profile_memory=True,
-                     with_stack=True) as prof:
-            with record_function("model_sampling"):
+        with record_function("0Model: DDIM_Sampling"):
+            samples, intermediates = self.ddim_sampling(conditioning, size,
+                                                        callback=callback,
+                                                        img_callback=img_callback,
+                                                        quantize_denoised=quantize_x0,
+                                                        mask=mask, x0=x0,
+                                                        ddim_use_original_steps=False,
+                                                        noise_dropout=noise_dropout,
+                                                        temperature=temperature,
+                                                        score_corrector=score_corrector,
+                                                        corrector_kwargs=corrector_kwargs,
+                                                        x_T=x_T,
+                                                        log_every_t=log_every_t,
+                                                        unconditional_guidance_scale=unconditional_guidance_scale,
+                                                        unconditional_conditioning=unconditional_conditioning,
+                                                        dynamic_threshold=dynamic_threshold,
+                                                        ucg_schedule=ucg_schedule
 
-                samples, intermediates = self.ddim_sampling(conditioning, size,
-                                                            callback=callback,
-                                                            img_callback=img_callback,
-                                                            quantize_denoised=quantize_x0,
-                                                            mask=mask, x0=x0,
-                                                            ddim_use_original_steps=False,
-                                                            noise_dropout=noise_dropout,
-                                                            temperature=temperature,
-                                                            score_corrector=score_corrector,
-                                                            corrector_kwargs=corrector_kwargs,
-                                                            x_T=x_T,
-                                                            log_every_t=log_every_t,
-                                                            unconditional_guidance_scale=unconditional_guidance_scale,
-                                                            unconditional_conditioning=unconditional_conditioning,
-                                                            dynamic_threshold=dynamic_threshold,
-                                                            ucg_schedule=ucg_schedule
+                                                    )
 
-                                                            )
-
-        print(prof.key_averages().table(sort_by="cuda_time_total"))
         return samples, intermediates
 
     @torch.no_grad()
