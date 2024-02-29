@@ -18,6 +18,9 @@ from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
 from ldm.models.diffusion.dpm_solver import DPMSolverSampler
 
+import tomesd
+from torch.profiler import profile, record_function, ProfilerActivity
+
 torch.set_grad_enabled(False)
 
 def chunk(it, size):
@@ -97,7 +100,7 @@ def parse_args():
     parser.add_argument(
         "--n_iter",
         type=int,
-        default=3,
+        default=1,
         help="sample this often",
     )
     parser.add_argument(
@@ -127,7 +130,7 @@ def parse_args():
     parser.add_argument(
         "--n_samples",
         type=int,
-        default=3,
+        default=1,
         help="how many samples to produce for each given prompt. A.k.a batch size",
     )
     parser.add_argument(
@@ -217,6 +220,9 @@ def main(opt):
     config = OmegaConf.load(f"{opt.config}")
     device = torch.device("cuda") if opt.device == "cuda" else torch.device("cpu")
     model = load_model_from_config(config, f"{opt.ckpt}", device)
+
+    tome_ratio = 0.5
+    tomesd.apply_patch(model, ratio=tome_ratio)
 
     if opt.plms:
         sampler = PLMSSampler(model, device=device)
@@ -352,7 +358,9 @@ def main(opt):
                                                      unconditional_guidance_scale=opt.scale,
                                                      unconditional_conditioning=uc,
                                                      eta=opt.ddim_eta,
-                                                     x_T=start_code)
+                                                     x_T=start_code,
+                                                     tome_ratio=tome_ratio
+                                                )
 
                     x_samples = model.decode_first_stage(samples)
                     x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
