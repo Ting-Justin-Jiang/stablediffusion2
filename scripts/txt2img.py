@@ -18,8 +18,8 @@ from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
 from ldm.models.diffusion.dpm_solver import DPMSolverSampler
 
+from ldm.tome import patch as cache_merge
 import tomesd
-from torch.profiler import profile, record_function, ProfilerActivity
 
 torch.set_grad_enabled(False)
 
@@ -100,7 +100,7 @@ def parse_args():
     parser.add_argument(
         "--n_iter",
         type=int,
-        default=1,
+        default=10,
         help="sample this often",
     )
     parser.add_argument(
@@ -221,11 +221,13 @@ def main(opt):
     device = torch.device("cuda") if opt.device == "cuda" else torch.device("cpu")
     model = load_model_from_config(config, f"{opt.ckpt}", device)
 
-    # profiling option
-    custom_record_functions = ["DDIM_Sampling", "UNet_output_blocks", "UNet_input_blocks", "VAE_Decoder",
-                               "UNet_middle_block", "Attention_Block"]
-    tome_ratio = 0.5
-    tomesd.apply_patch(model, ratio=tome_ratio)
+    model = cache_merge.apply_patch(model, ratio=0.75, sx=2, sy=2, max_downsample=1,
+                                    semi_rand_schedule=True,
+                                    unmerge_residual=True,
+                                    cache_similarity=False,
+                                    partial_attention=False)
+
+    # model = tomesd.apply_patch(model, ratio=0.75, sx=2, sy=2, max_downsample=1)
 
     if opt.plms:
         sampler = PLMSSampler(model, device=device)
@@ -346,30 +348,25 @@ def main(opt):
             all_samples = list()
             for n in trange(opt.n_iter, desc="Sampling"):
                 for prompts in tqdm(data, desc="data"):
-                    with profile(activities=[
-                                torch.profiler.ProfilerActivity.CPU,
-                                torch.profiler.ProfilerActivity.CUDA,
-                                ]) as prof:
-                        uc = None
-                        if opt.scale != 1.0:
-                            uc = model.get_learned_conditioning(batch_size * [""])
-                        if isinstance(prompts, tuple):
-                            prompts = list(prompts)
-                        c = model.get_learned_conditioning(prompts)
-                        shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
-                        samples, _ = sampler.sample(S=opt.steps,
-                                                    conditioning=c,
-                                                    batch_size=opt.n_samples,
-                                                    shape=shape,
-                                                    verbose=False,
-                                                    unconditional_guidance_scale=opt.scale,
-                                                    unconditional_conditioning=uc,
-                                                    eta=opt.ddim_eta,
-                                                    x_T=start_code
-                                                    )
-                        with record_function("0Model: VAE_Decoder"):
-                            x_samples = model.decode_first_stage(samples)
-                        x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
+                    uc = None
+                    if opt.scale != 1.0:
+                        uc = model.get_learned_conditioning(batch_size * [""])
+                    if isinstance(prompts, tuple):
+                        prompts = list(prompts)
+                    c = model.get_learned_conditioning(prompts)
+                    shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
+                    samples, _ = sampler.sample(S=opt.steps,
+                                                     conditioning=c,
+                                                     batch_size=opt.n_samples,
+                                                     shape=shape,
+                                                     verbose=False,
+                                                     unconditional_guidance_scale=opt.scale,
+                                                     unconditional_conditioning=uc,
+                                                     eta=opt.ddim_eta,
+                                                     x_T=start_code)
+
+                    x_samples = model.decode_first_stage(samples)
+                    x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
 
                     for x_sample in x_samples:
                         x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
@@ -380,8 +377,8 @@ def main(opt):
                         sample_count += 1
 
                     all_samples.append(x_samples)
+                    cache_merge.reset_cache(model)
 
-            print(prof.key_averages().table(sort_by="cuda_time_total"))
             # additionally, save as grid
             grid = torch.stack(all_samples, 0)
             grid = rearrange(grid, 'n b c h w -> (n b) c h w')
