@@ -1,41 +1,68 @@
+"""
+Code adapted from original tomesd: https://github.com/dbolya/tomesd
+"""
+DEBUG_MODE: bool = True
 import torch
+
 import math
 from .merge import *
 from typing import Type, Dict, Any, Tuple, Callable
-from tomesd.utils import isinstance_str, init_generator
+from .utils import isinstance_str, init_generator
 
 
 class CacheBus:
-    """A Bus class for efficient communication between blocks at a given timestep."""
+    """A Bus class for overall control."""
     def __init__(self):
-        self.feature_maps = {} # key: index, value: feature_maps
-        self.rand_indices = {} # key: downsampling (for partial attention) / block_index, value: rand_idx
-        self.similarity_scores = {} # key:  downsampling, value: similarity_scores
+        self.rand_indices = {}  # key: index, value: rand_idx
 
 
 class Cache:
-    def __init__(self, cache_bus: CacheBus, index: int):
+    def __init__(self, index: int, cache_bus: CacheBus, broadcast_range: int = 1):
         self.cache_bus = cache_bus
         self.feature_map = None
+        self.feature_map_broadcast = None
         self.index = index
+        self.rand_indices = None
+        self.broadcast_range = broadcast_range
         self.step = 0
 
+    # == 1. Cache Merge Operations == #
     def push(self, x: torch.Tensor, index: torch.Tensor = None) -> None:
         if self.feature_map is None:
             # x would be the entire feature map during the first cache update
             self.feature_map = x.clone()
-            self.cache_bus.feature_maps[self.index] = self.feature_map # this will add feature maps to corresponding indices
+            if DEBUG_MODE: print(f"\033[96mCache Push\033[0m: Initial push x: \033[95m{x.shape}\033[0m to cache index: \033[91m{self.index}\033[0m")
         else:
             # x would be the dst (updated) tokens during subsequent cache updates
             self.feature_map.scatter_(dim=-2, index=index, src=x.clone())
-            self.cache_bus.feature_maps[self.index].scatter_(dim=-2, index=index, src=x.clone())
+            if DEBUG_MODE: print(f"\033[96mCache Push\033[0m: Push x: \033[95m{x.shape}\033[0m to cache index: \033[91m{self.index}\033[0m")
 
     def pop(self, index: torch.Tensor) -> torch.Tensor:
         # Retrieve the src tokens from the cached feature map
-        return torch.gather(self.feature_map, dim=-2, index=index)
+        x = torch.gather(self.feature_map, dim=-2, index=index)
+        if DEBUG_MODE: print(f"\033[96mCache Pop\033[0m: Pop x: \033[95m{x.shape}\033[0m to cache index: \033[91m{self.index}\033[0m")
+        return x
+
+    # == 2. Broadcast Operations == #
+    def save(self, x: torch.Tensor) -> None:
+        self.feature_map_broadcast = x.clone()
+
+    def broadcast(self) -> torch.Tensor:
+        if self.feature_map_broadcast is None:
+            raise RuntimeError
+        else:
+            return self.feature_map_broadcast
+
+    def should_save(self, broadcast_start: int) -> bool:
+        if (self.step - broadcast_start) % self.broadcast_range == 0:
+            if DEBUG_MODE: print(f"\033[96mBroadcast\033[0m: Save at step: {self.step} cache index: \033[91m{self.index}\033[0m")
+            return True  # Save at this step
+        else:
+            if DEBUG_MODE: print(f"\033[96mBroadcast\033[0m: Broadcast at step: {self.step} cache index: \033[91m{self.index}\033[0m")
+            return False # Broadcast at this step
 
 
-def compute_merge(x: torch.Tensor, tome_info: Dict[str, Any], cache: Cache) -> Tuple[Callable, ...]:
+def compute_merge(x: torch.Tensor, mode:str, tome_info: Dict[str, Any], cache: Cache) -> Tuple[Callable, ...]:
     original_h, original_w = tome_info["size"]
     original_tokens = original_h * original_w
     downsample = int(math.ceil(math.sqrt(original_tokens // x.shape[1])))
@@ -58,62 +85,37 @@ def compute_merge(x: torch.Tensor, tome_info: Dict[str, Any], cache: Cache) -> T
         use_rand = False if x.shape[0] % 2 == 1 else args["use_rand"]
 
         # retrieve semi-random merging schedule
-        if tome_info['args']['semi_rand_schedule']:
-            if not tome_info['args']['partial_attention']:
-                if cache.index not in cache.cache_bus.rand_indices:
-                    rand_indices = generate_semi_random_indices(tome_info["args"]['sx'], tome_info["args"]['sy'], h, w, steps=128)
-                    cache.cache_bus.rand_indices[cache.index] = rand_indices
-                else:
-                    rand_indices = cache.cache_bus.rand_indices[cache.index]
-            else:
-                if downsample not in cache.cache_bus.rand_indices:
-                    rand_indices = generate_semi_random_indices(tome_info["args"]['sx'], tome_info["args"]['sy'], h, w, steps=128)
-                    cache.cache_bus.rand_indices[downsample] = rand_indices
-                else:
-                    rand_indices = cache.cache_bus.rand_indices[downsample]
+        if mode == 'cache_merge':
+            if cache.rand_indices is None:
+                cache.rand_indices = cache.cache_bus.rand_indices[cache.index].copy()
+            rand_indices = cache.rand_indices
         else:
             rand_indices = None
 
         # the function defines the indices to merge and unmerge
         m, u = bipartite_soft_matching_random2d(x, w, h, args["sx"], args["sy"], r, tome_info,
-                                                      no_rand=not use_rand, generator=args["generator"],
-                                                      cache=cache, rand_indices=rand_indices)
-        message = f"token merging operates at downsample: \033[91m{downsample}\033[0m, original x shape: \033[91m{x.shape}\033[0m, merged: \033[91m{r}\033[0m"
+                                              no_rand=not use_rand, unmerge_mode=mode,
+                                              cache=cache, rand_indices=rand_indices, generator=args["generator"],)
     else:
         m, u = (do_nothing, do_nothing)
-        message = "token merging does nothing"
 
-    m_a, u_a = (m, u) if args["merge_attn"] else (do_nothing, do_nothing)
-    m_c, u_c = (m, u) if args["merge_crossattn"] else (do_nothing, do_nothing)
-    m_m, u_m = (m, u) if args["merge_mlp"] else (do_nothing, do_nothing)
-
-    return m_a, m_c, m_m, u_a, u_c, u_m  # Okay this is probably not very good
+    return m, u
 
 
-def make_tome_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
-    """
-    Make a patched class on the fly so we don't have to import any specific modules.
-    This patch applies ToMe to the forward function of the block.
-    """
-
+def make_tome_block(block_class: Type[torch.nn.Module], mode: str = 'token_merge') -> Type[torch.nn.Module]:
     class ToMeBlock(block_class):
         # Save for unpatching later
         _parent = block_class
+        _mode = mode
 
         def _forward(self, x: torch.Tensor, context: torch.Tensor = None) -> torch.Tensor:
-            m_a, m_c, m_m, u_a, u_c, u_m = compute_merge(x, self._tome_info, self._cache)
+            m_a, u_a = compute_merge(x, self._mode, self._tome_info, self._cache)
 
-            # This is where the meat of the computation happens
-            # self attention
-            x_a = m_a(self.norm1(x))
-            x_a = self.attn1(x_a, context=context if self.disable_self_attn else None)
-            x = u_a(x_a) + x
-
-            x = u_c(self.attn2(m_c(self.norm2(x)), context=context)) + x
-            x = u_m(self.ff(m_m(self.norm3(x)))) + x
+            x = u_a(self.attn1(m_a(self.norm1(x), prune=True), context=context if self.disable_self_attn else None)) + x
+            x = self.attn2(self.norm2(x), context=context) + x
+            x = self.ff(self.norm3(x)) + x
 
             self._cache.step += 1
-
             return x
 
     return ToMeBlock
@@ -129,34 +131,33 @@ def hook_tome_model(model: torch.nn.Module):
     model._tome_info["hooks"].append(model.register_forward_pre_hook(hook))
 
 
-def generate_semi_random_indices(sy, sx, h, w, steps):
+def generate_semi_random_indices(sy: int, sx: int, h: int, w: int, steps: int) -> list:
     """
-    generates a semi-random merging schedule given the grid size
+    Generates a semi-random merging schedule given the grid size.
     """
     hsy, wsx = h // sy, w // sx
     cycle_length = sy * sx
-    num_cycles = (steps + cycle_length - 1) // cycle_length
+    num_cycles = -(-steps // cycle_length)
 
-    full_sequence = []
+    num_positions = hsy * wsx
 
-    for _ in range(hsy * wsx):
-        sequence = torch.cat([
-            torch.randperm(cycle_length)
-            for _ in range(num_cycles)
-        ])
-        full_sequence.append(sequence[:steps])
+    # Generate random permutations for all positions
+    random_numbers = torch.rand(num_positions, num_cycles * cycle_length)
+    indices = random_numbers.argsort(dim=1)
+    indices = indices[:, :steps] % cycle_length  # Map indices to [0, cycle_length - 1]
 
-    full_sequence = torch.stack(full_sequence).to(torch.int64)
-    rand_idx = full_sequence.reshape(hsy, wsx, steps).permute(2, 0, 1).unsqueeze(-1)
+    # Reshape to (hsy, wsx, steps)
+    indices = indices.view(hsy, wsx, steps)
+
+    rand_idx = [indices[:, :, step].unsqueeze(-1) for step in range(steps)]
     return rand_idx
 
 
 def reset_cache(model: torch.nn.Module):
     diffusion_model = model.model.diffusion_model
-    bus = CacheBus()
+    bus = diffusion_model._bus
     index = 0
     for _, module in diffusion_model.named_modules():
-        # If for some reason this has a different name, create an issue and I'll fix it
         if isinstance_str(module, "ToMeBlock"):
             module._cache = Cache(cache_bus=bus, index=index)
             index += 1
@@ -167,24 +168,22 @@ def reset_cache(model: torch.nn.Module):
 def apply_patch(
         model: torch.nn.Module,
         ratio: float = 0.5,
+        mode: str = "token_merge",
         max_downsample: int = 1,
         sx: int = 2, sy: int = 2,
         use_rand: bool = True,
-        merge_attn: bool = True,
-        merge_crossattn: bool = False,
-        merge_mlp: bool = False,
 
-        # == Cache Merge ablation arguments == #
-        semi_rand_schedule: bool = False,
-        unmerge_residual: bool = False,
-        cache_similarity: bool = False,
-        partial_attention: bool = False,
+        latent_size: Tuple[int, int] = (96, 96),
+        merge_step: Tuple[int, int] = (1, 49),
+        cache_step: Tuple[int, int] = (1, 49),
+        push_unmerged: bool = True,
 ):
+    # == merging preparation ==
+    global DEBUG_MODE
+    if DEBUG_MODE: print('Start with \033[95mDEBUG\033[0m mode')
+    print('\033[94mApplying Token Merging\033[0m')
 
-    if not semi_rand_schedule:
-        assert partial_attention is False, "Cannot apply partial attention without merging scheduler"
-    if cache_similarity:
-        assert partial_attention is True, "Cannot cache similarity without partial attention"
+    cache_start = max(cache_step[0], 1)  # Make sure the first step is token merging to avoid cache access
 
     # Make sure the module is not currently patched
     remove_patch(model)
@@ -194,38 +193,52 @@ def apply_patch(
         raise RuntimeError("Provided model was not a Stable Diffusion / Latent Diffusion model, as expected.")
     diffusion_model = model.model.diffusion_model
 
+    print(
+        "\033[96mArguments:\033[0m\n"
+        f"ratio: {ratio}\n"
+        f"max_downsample: {max_downsample}\n"
+        f"mode: {mode}\n"
+        f"sx: {sx}, sy: {sy}\n"
+        f"use_rand: {use_rand}\n"
+        f"latent_size: {latent_size}\n"
+        f"merge_step: {merge_step}\n"
+        f"cache_step: {cache_start, cache_step[-1]}\n"
+        f"push_unmerged: {push_unmerged}\n"
+    )
+
     diffusion_model._tome_info = {
         "size": None,
         "hooks": [],
         "args": {
             "ratio": ratio,
+            "mode": mode,
             "max_downsample": max_downsample,
             "sx": sx, "sy": sy,
             "use_rand": use_rand,
             "generator": None,
-            "merge_attn": merge_attn,
-            "merge_crossattn": merge_crossattn,
-            "merge_mlp": merge_mlp,
 
-            # == Cache Merge ablation arguments == #
-            "semi_rand_schedule": semi_rand_schedule,
-            "unmerge_residual": unmerge_residual,
-            "cache_similarity": cache_similarity,
-            "partial_attention": partial_attention
+            "latent_size": latent_size,
+            "merge_start": merge_step[0],
+            "merge_end": merge_step[-1],
+            "cache_start": cache_start,
+            "cache_end": cache_step[-1],
+            "push_unmerged": push_unmerged
         }
     }
 
     hook_tome_model(diffusion_model)
 
-    bus = CacheBus()
+    diffusion_model._bus = CacheBus()
     index = 0
     for _, module in diffusion_model.named_modules():
-        # If for some reason this has a different name, create an issue and I'll fix it
         if isinstance_str(module, "BasicTransformerBlock"):
-            module.__class__ = make_tome_block(module.__class__)
+            module.__class__ = make_tome_block(module.__class__, mode=mode)
             module._tome_info = diffusion_model._tome_info
-            module._cache = Cache(cache_bus=bus, index=index)
-
+            module._cache = Cache(cache_bus=diffusion_model._bus, index=index)
+            rand_indices = generate_semi_random_indices(module._tome_info["args"]['sy'],
+                                                        module._tome_info["args"]['sx'],
+                                                        latent_size[0], latent_size[1], steps=50)
+            module._cache.cache_bus.rand_indices[module._cache.index] = rand_indices
             index += 1
 
             # Something introduced in SD 2.0 (LDM only)

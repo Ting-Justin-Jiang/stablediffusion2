@@ -1,5 +1,6 @@
 import argparse, os
 import cv2
+import math
 import torch
 import numpy as np
 from omegaconf import OmegaConf
@@ -19,7 +20,6 @@ from ldm.models.diffusion.plms import PLMSSampler
 from ldm.models.diffusion.dpm_solver import DPMSolverSampler
 
 from ldm.tome import patch as cache_merge
-import tomesd
 
 torch.set_grad_enabled(False)
 
@@ -100,7 +100,7 @@ def parse_args():
     parser.add_argument(
         "--n_iter",
         type=int,
-        default=10,
+        default=4,
         help="sample this often",
     )
     parser.add_argument(
@@ -136,13 +136,13 @@ def parse_args():
     parser.add_argument(
         "--n_rows",
         type=int,
-        default=0,
+        default=2,
         help="rows in the grid (default: n_samples)",
     )
     parser.add_argument(
         "--scale",
         type=float,
-        default=9.0,
+        default=7.0,
         help="unconditional guidance scale: eps = eps(x, empty) + scale * (eps(x, cond) - eps(x, empty))",
     )
     parser.add_argument(
@@ -221,13 +221,16 @@ def main(opt):
     device = torch.device("cuda") if opt.device == "cuda" else torch.device("cpu")
     model = load_model_from_config(config, f"{opt.ckpt}", device)
 
-    model = cache_merge.apply_patch(model, ratio=0.75, sx=2, sy=2, max_downsample=1,
-                                    semi_rand_schedule=True,
-                                    unmerge_residual=True,
-                                    cache_similarity=False,
-                                    partial_attention=False)
-
-    # model = tomesd.apply_patch(model, ratio=0.75, sx=2, sy=2, max_downsample=1)
+    model = cache_merge.apply_patch(model,
+                                    ratio=0.7,
+                                    mode="cache_merge",
+                                    sx=2, sy=2,
+                                    max_downsample=1,
+                                    latent_size=(2 * math.ceil(opt.H / 16),
+                                                 2 * math.ceil(opt.W / 16)),
+                                    merge_step=(1, 49),
+                                    cache_step=(1, 49),
+                                    push_unmerged=True)
 
     if opt.plms:
         sampler = PLMSSampler(model, device=device)
