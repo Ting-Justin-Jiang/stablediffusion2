@@ -3,10 +3,10 @@ Code adapted from original tomesd: https://github.com/dbolya/tomesd
 """
 DEBUG_MODE: bool = True
 import torch
-
+import numpy as np
 import math
 from .merge import *
-from typing import Type, Dict, Any, Tuple, Callable
+from typing import Type, Dict, Any, Tuple, Callable, List, Optional
 from .utils import isinstance_str, init_generator
 
 
@@ -14,6 +14,7 @@ class CacheBus:
     """A Bus class for overall control."""
     def __init__(self):
         self.rand_indices = {}  # key: index, value: rand_idx
+        self.model_outputs = {}
 
 
 class Cache:
@@ -69,7 +70,8 @@ def compute_merge(x: torch.Tensor, mode:str, tome_info: Dict[str, Any], cache: C
 
     args = tome_info["args"]
 
-    if downsample <= args["max_downsample"]:
+    if (args['deep_cache'] and (downsample <= args["max_downsample"] and (cache.index in (0, 13, 14)))) or \
+            (not args['deep_cache'] and downsample <= args["max_downsample"]):
         w = int(math.ceil(original_w / downsample))
         h = int(math.ceil(original_h / downsample))
         r = int(x.shape[1] * args["ratio"])
@@ -102,6 +104,68 @@ def compute_merge(x: torch.Tensor, mode:str, tome_info: Dict[str, Any], cache: C
     return m, u
 
 
+def patch_solver(solver_class):
+    class PatchedDPMSolverMultistepScheduler(solver_class):
+        def multistep_dpm_solver_second_order_update(
+            self,
+            model_output_list: List[torch.FloatTensor],
+            *args,
+            sample: torch.FloatTensor = None,
+            noise: Optional[torch.FloatTensor] = None,
+            **kwargs,
+        ) -> torch.FloatTensor:
+            if sample is None:
+                if len(args) > 2:
+                    sample = args[2]
+                else:
+                    raise ValueError(" missing `sample` as a required keyward argument")
+
+            sigma_t, sigma_s0, sigma_s1 = (
+                self.sigmas[self.step_index + 1],
+                self.sigmas[self.step_index],
+                self.sigmas[self.step_index - 1],
+            )
+
+            alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma_t)
+            alpha_s0, sigma_s0 = self._sigma_to_alpha_sigma_t(sigma_s0)
+            alpha_s1, sigma_s1 = self._sigma_to_alpha_sigma_t(sigma_s1)
+
+            lambda_t = torch.log(alpha_t) - torch.log(sigma_t)
+            lambda_s0 = torch.log(alpha_s0) - torch.log(sigma_s0)
+            lambda_s1 = torch.log(alpha_s1) - torch.log(sigma_s1)
+
+            m0, m1 = model_output_list[-1], model_output_list[-2]
+
+            h, h_0 = lambda_t - lambda_s0, lambda_s0 - lambda_s1
+            r0 = h_0 / h
+            D0, D1 = m0, (1.0 / r0) * (m0 - m1)
+            if self.config.algorithm_type == "dpmsolver++":
+                # See https://arxiv.org/abs/2211.01095 for detailed derivations
+                if self.config.solver_type == "midpoint":
+                    x_t = (
+                        (sigma_t / sigma_s0) * sample
+                        - (alpha_t * (torch.exp(-h) - 1.0)) * D0
+                        - 0.5 * (alpha_t * (torch.exp(-h) - 1.0)) * D1
+                    )
+                elif self.config.solver_type == "heun":
+                    x_t = (
+                        (sigma_t / sigma_s0) * sample
+                        - (alpha_t * (torch.exp(-h) - 1.0)) * D0
+                        + (alpha_t * ((torch.exp(-h) - 1.0) / h + 1.0)) * D1
+                    )
+                else:
+                    raise RuntimeError
+            else:
+                raise RuntimeError
+
+            # feature_map = np.array(x_t.cpu(), dtype=np.float32).astype(np.float16)
+            # self._cache_bus.model_outputs.append(feature_map)
+
+            return x_t
+
+    return PatchedDPMSolverMultistepScheduler
+
+
 def make_tome_block(block_class: Type[torch.nn.Module], mode: str = 'token_merge') -> Type[torch.nn.Module]:
     class ToMeBlock(block_class):
         # Save for unpatching later
@@ -111,12 +175,91 @@ def make_tome_block(block_class: Type[torch.nn.Module], mode: str = 'token_merge
         def _forward(self, x: torch.Tensor, context: torch.Tensor = None) -> torch.Tensor:
             m_a, u_a = compute_merge(x, self._mode, self._tome_info, self._cache)
 
-            x = u_a(self.attn1(m_a(self.norm1(x), prune=True), context=context if self.disable_self_attn else None)) + x
+            x = u_a(self.attn1(m_a(self.norm1(x), prune=self._tome_info['args']['prune']), context=context if self.disable_self_attn else None)) + x
             x = self.attn2(self.norm2(x), context=context) + x
             x = self.ff(self.norm3(x)) + x
 
             self._cache.step += 1
             return x
+
+    return ToMeBlock
+
+
+def make_diffusers_tome_block(block_class: Type[torch.nn.Module], mode: str = 'token_merge') -> Type[torch.nn.Module]:
+    class ToMeBlock(block_class):
+        # Save for unpatching later
+        _parent = block_class
+        _mode = mode
+
+        def forward(
+                self,
+                hidden_states,
+                attention_mask=None,
+                encoder_hidden_states=None,
+                encoder_attention_mask=None,
+                timestep=None,
+                cross_attention_kwargs=None,
+                class_labels=None,
+        ) -> torch.Tensor:
+            # (1) ToMe
+            m_a, u_a = compute_merge(hidden_states, self._mode, self._tome_info, self._cache)
+
+            if self.use_ada_layer_norm:
+                norm_hidden_states = self.norm1(hidden_states, timestep)
+            elif self.use_ada_layer_norm_zero:
+                norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(
+                    hidden_states, timestep, class_labels, hidden_dtype=hidden_states.dtype
+                )
+            else:
+                norm_hidden_states = self.norm1(hidden_states)
+
+            # (2) ToMe m_a
+            norm_hidden_states = m_a(norm_hidden_states, prune=self._tome_info['args']['prune'])
+
+            # 1. Self-Attention
+            cross_attention_kwargs = cross_attention_kwargs if cross_attention_kwargs is not None else {}
+            attn_output = self.attn1(
+                norm_hidden_states,
+                encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
+                attention_mask=attention_mask,
+                **cross_attention_kwargs,
+            )
+            if self.use_ada_layer_norm_zero:
+                attn_output = gate_msa.unsqueeze(1) * attn_output
+
+            # (3) ToMe u_a
+            hidden_states = u_a(attn_output) + hidden_states
+
+            if self.attn2 is not None:
+                norm_hidden_states = (
+                    self.norm2(hidden_states, timestep) if self.use_ada_layer_norm else self.norm2(hidden_states)
+                )
+
+                # 2. Cross-Attention
+                attn_output = self.attn2(
+                    norm_hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    attention_mask=encoder_attention_mask,
+                    **cross_attention_kwargs,
+                )
+                hidden_states = attn_output + hidden_states
+
+
+            # 3. Feed-forward
+            norm_hidden_states = self.norm3(hidden_states)
+
+            if self.use_ada_layer_norm_zero:
+                norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+
+            ff_output = self.ff(norm_hidden_states)
+
+            if self.use_ada_layer_norm_zero:
+                ff_output = gate_mlp.unsqueeze(1) * ff_output
+            hidden_states = ff_output + hidden_states
+
+            self._cache.step += 1
+
+            return hidden_states
 
     return ToMeBlock
 
@@ -154,7 +297,12 @@ def generate_semi_random_indices(sy: int, sx: int, h: int, w: int, steps: int) -
 
 
 def reset_cache(model: torch.nn.Module):
-    diffusion_model = model.model.diffusion_model
+    is_diffusers = isinstance_str(model, "DiffusionPipeline") or isinstance_str(model, "ModelMixin")
+    if not is_diffusers:
+        diffusion_model = model.model.diffusion_model
+    else:
+        diffusion_model = model.unet if hasattr(model, "unet") else model
+
     bus = diffusion_model._bus
     index = 0
     for _, module in diffusion_model.named_modules():
@@ -169,6 +317,7 @@ def apply_patch(
         model: torch.nn.Module,
         ratio: float = 0.5,
         mode: str = "token_merge",
+        prune: bool = "true",
         max_downsample: int = 1,
         sx: int = 2, sy: int = 2,
         use_rand: bool = True,
@@ -177,6 +326,8 @@ def apply_patch(
         merge_step: Tuple[int, int] = (1, 49),
         cache_step: Tuple[int, int] = (1, 49),
         push_unmerged: bool = True,
+
+        deep_cache: bool = True
 ):
     # == merging preparation ==
     global DEBUG_MODE
@@ -188,14 +339,22 @@ def apply_patch(
     # Make sure the module is not currently patched
     remove_patch(model)
 
-    if not hasattr(model, "model") or not hasattr(model.model, "diffusion_model"):
-        # Provided model not supported
-        raise RuntimeError("Provided model was not a Stable Diffusion / Latent Diffusion model, as expected.")
-    diffusion_model = model.model.diffusion_model
+    is_diffusers = isinstance_str(model, "DiffusionPipeline") or isinstance_str(model, "ModelMixin")
+
+    if not is_diffusers:
+        if not hasattr(model, "model") or not hasattr(model.model, "diffusion_model"):
+            # Provided model not supported
+            raise RuntimeError("Provided model was not a Stable Diffusion / Latent Diffusion model, as expected.")
+        diffusion_model = model.model.diffusion_model
+    else:
+        # Supports "pipe.unet" and "unet"
+        diffusion_model = model.unet if hasattr(model, "unet") else model
+    solver = model.scheduler
 
     print(
         "\033[96mArguments:\033[0m\n"
         f"ratio: {ratio}\n"
+        f"prune: {prune}\n"
         f"max_downsample: {max_downsample}\n"
         f"mode: {mode}\n"
         f"sx: {sx}, sy: {sy}\n"
@@ -204,6 +363,7 @@ def apply_patch(
         f"merge_step: {merge_step}\n"
         f"cache_step: {cache_start, cache_step[-1]}\n"
         f"push_unmerged: {push_unmerged}\n"
+        f"deep_cahce: {deep_cache}"
     )
 
     diffusion_model._tome_info = {
@@ -212,6 +372,7 @@ def apply_patch(
         "args": {
             "ratio": ratio,
             "mode": mode,
+            "prune": prune,
             "max_downsample": max_downsample,
             "sx": sx, "sy": sy,
             "use_rand": use_rand,
@@ -222,22 +383,29 @@ def apply_patch(
             "merge_end": merge_step[-1],
             "cache_start": cache_start,
             "cache_end": cache_step[-1],
-            "push_unmerged": push_unmerged
+            "push_unmerged": push_unmerged,
+
+            "deep_cache": deep_cache
         }
     }
 
     hook_tome_model(diffusion_model)
 
     diffusion_model._bus = CacheBus()
+
+    solver.__class__ = patch_solver(solver.__class__)
+    solver._cache_bus = diffusion_model._bus
+
     index = 0
     for _, module in diffusion_model.named_modules():
         if isinstance_str(module, "BasicTransformerBlock"):
-            module.__class__ = make_tome_block(module.__class__, mode=mode)
+            make_tome_block_fn = make_diffusers_tome_block if is_diffusers else make_tome_block
+            module.__class__ = make_tome_block_fn(module.__class__, mode=mode)
             module._tome_info = diffusion_model._tome_info
             module._cache = Cache(cache_bus=diffusion_model._bus, index=index)
             rand_indices = generate_semi_random_indices(module._tome_info["args"]['sy'],
                                                         module._tome_info["args"]['sx'],
-                                                        latent_size[0], latent_size[1], steps=50)
+                                                        latent_size[0], latent_size[1], steps=60)
             module._cache.cache_bus.rand_indices[module._cache.index] = rand_indices
             index += 1
 

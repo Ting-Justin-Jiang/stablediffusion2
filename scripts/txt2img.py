@@ -142,7 +142,7 @@ def parse_args():
     parser.add_argument(
         "--scale",
         type=float,
-        default=7.0,
+        default=7.5,
         help="unconditional guidance scale: eps = eps(x, empty) + scale * (eps(x, cond) - eps(x, empty))",
     )
     parser.add_argument(
@@ -164,7 +164,7 @@ def parse_args():
     parser.add_argument(
         "--seed",
         type=int,
-        default=42,
+        default=512,
         help="the seed (for reproducible sampling)",
     )
     parser.add_argument(
@@ -222,7 +222,7 @@ def main(opt):
     model = load_model_from_config(config, f"{opt.ckpt}", device)
 
     model = cache_merge.apply_patch(model,
-                                    ratio=0.7,
+                                    ratio=0.,
                                     mode="cache_merge",
                                     sx=2, sy=2,
                                     max_downsample=1,
