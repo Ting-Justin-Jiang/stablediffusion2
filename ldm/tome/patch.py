@@ -14,17 +14,24 @@ class CacheBus:
     """A Bus class for overall control."""
     def __init__(self):
         self.rand_indices = {}  # key: index, value: rand_idx
-        self.model_outputs = {}
+        # self.model_outputs = {}
+        # self.model_outputs_change = {}
+
+        self.prev_fm = None
+        self.prev_prev_fm = None
+        self.temporal_score = None
+        self.step = 1  # todo untested, just because dpm 2M starts from 2
 
 
 class Cache:
     def __init__(self, index: int, cache_bus: CacheBus, broadcast_range: int = 1):
         self.cache_bus = cache_bus
+
         self.feature_map = None
-        self.feature_map_broadcast = None
+        self.feature_map_mlp = None
+
         self.index = index
         self.rand_indices = None
-        self.broadcast_range = broadcast_range
         self.step = 0
 
     # == 1. Cache Merge Operations == #
@@ -43,24 +50,6 @@ class Cache:
         x = torch.gather(self.feature_map, dim=-2, index=index)
         if DEBUG_MODE: print(f"\033[96mCache Pop\033[0m: Pop x: \033[95m{x.shape}\033[0m to cache index: \033[91m{self.index}\033[0m")
         return x
-
-    # == 2. Broadcast Operations == #
-    def save(self, x: torch.Tensor) -> None:
-        self.feature_map_broadcast = x.clone()
-
-    def broadcast(self) -> torch.Tensor:
-        if self.feature_map_broadcast is None:
-            raise RuntimeError
-        else:
-            return self.feature_map_broadcast
-
-    def should_save(self, broadcast_start: int) -> bool:
-        if (self.step - broadcast_start) % self.broadcast_range == 0:
-            if DEBUG_MODE: print(f"\033[96mBroadcast\033[0m: Save at step: {self.step} cache index: \033[91m{self.index}\033[0m")
-            return True  # Save at this step
-        else:
-            if DEBUG_MODE: print(f"\033[96mBroadcast\033[0m: Broadcast at step: {self.step} cache index: \033[91m{self.index}\033[0m")
-            return False # Broadcast at this step
 
 
 def compute_merge(x: torch.Tensor, mode:str, tome_info: Dict[str, Any], cache: Cache) -> Tuple[Callable, ...]:
@@ -158,9 +147,81 @@ def patch_solver(solver_class):
             else:
                 raise RuntimeError
 
-            # feature_map = np.array(x_t.cpu(), dtype=np.float32).astype(np.float16)
-            # self._cache_bus.model_outputs.append(feature_map)
+            # # logging 1
+            # feature_map = np.array(m0[0].unsqueeze(dim=0).cpu(), dtype=np.float32).astype(np.float16)
+            # self._cache_bus.model_outputs[self._cache_bus.step] = feature_map
 
+            choice = "second_order"
+
+            if choice == "third_order":
+                if self._cache_bus.step == 1: # the first time this code is reached
+                    self._cache_bus.prev_fm = m1.clone()
+                    score = None
+
+                elif self._cache_bus.step == 2: # the second time this code is reached
+                    self._cache_bus.prev_prev_fm = self._cache_bus.prev_fm.clone()
+                    self._cache_bus.prev_fm = m1.clone()
+                    score = None
+
+                else:
+                    cur_diff = (m0 - m1).abs().mean(dim=1)
+                    prev_diff = (m1 - self._cache_bus.prev_fm).abs().mean(dim=1)
+                    prev_prev_diff = (self._cache_bus.prev_fm - self._cache_bus.prev_prev_fm).abs().mean(dim=1)
+
+                    diff = abs((cur_diff + prev_prev_diff) / 2 - prev_diff)
+                    score = (diff > 0.75 * prev_diff).float()
+
+                    print(int(score.sum().item()))
+
+                    self._cache_bus.temporal_score = score
+
+                    self._cache_bus.prev_prev_fm = self._cache_bus.prev_fm.clone()
+                    self._cache_bus.prev_fm = m1.clone()
+
+            elif choice == "second_order":
+                if self._cache_bus.step == 1:  # the first time this code is reached
+                    self._cache_bus.prev_fm = m1.clone()
+                    score = None
+
+                else:
+                    cur_diff = (m0 - m1).abs().mean(dim=1)
+                    prev_diff = (m1 - self._cache_bus.prev_fm).abs().mean(dim=1)
+
+                    diff = abs(cur_diff - prev_diff)
+                    # score = (diff >= 0.15 * m1.abs().mean()).float() # here the metric is a single real number
+
+                    # Calculate the dynamic threshold value
+                    threshold_value = 0.05 * m1.abs().mean()
+                    threshold_num = 1024*5
+
+                    diff_flat = diff.view(-1)
+                    mask = diff_flat >= threshold_value
+                    num_exceeds = mask.sum().item()
+                    score_flat = torch.zeros_like(diff_flat)
+
+                    if num_exceeds > threshold_num:
+                        # If more elements exceed the threshold than allowed, select the top 'threshold' elements
+                        topk_values, topk_indices = torch.topk(diff_flat, threshold_num, largest=True, sorted=False)
+                        score_flat[topk_indices] = 1.0
+                    else:
+                        # If fewer elements exceed the threshold, set all of them to 1
+                        score_flat[mask] = 1.0
+
+                    score = score_flat.view_as(diff)
+
+                    self._cache_bus.temporal_score = score
+                    self._cache_bus.prev_fm = m1.clone()
+            else:
+                raise NotImplementedError
+
+            # # logging 2
+            # if score is not None:
+            #     score = score.expand([1, 4, 96, 96])
+            #     m0 = m0 + score * 2.5
+            # feature_map = np.array(m0[0].unsqueeze(dim=0).cpu(), dtype=np.float32).astype(np.float16)
+            # self._cache_bus.model_outputs_change[self._cache_bus.step] = feature_map
+
+            self._cache_bus.step += 1
             return x_t
 
     return PatchedDPMSolverMultistepScheduler
@@ -214,12 +275,12 @@ def make_diffusers_tome_block(block_class: Type[torch.nn.Module], mode: str = 't
                 norm_hidden_states = self.norm1(hidden_states)
 
             # (2) ToMe m_a
-            norm_hidden_states = m_a(norm_hidden_states, prune=self._tome_info['args']['prune'])
+            norm_hidden_states_ma = m_a(norm_hidden_states, prune=self._tome_info['args']['prune'])
 
             # 1. Self-Attention
             cross_attention_kwargs = cross_attention_kwargs if cross_attention_kwargs is not None else {}
             attn_output = self.attn1(
-                norm_hidden_states,
+                norm_hidden_states_ma,
                 encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
                 attention_mask=attention_mask,
                 **cross_attention_kwargs,
@@ -303,7 +364,12 @@ def reset_cache(model: torch.nn.Module):
     else:
         diffusion_model = model.unet if hasattr(model, "unet") else model
 
+    # reset bus
     bus = diffusion_model._bus
+    bus.prev_prev_fm = None
+    bus.temporal_score = None
+    bus.step = 1
+
     index = 0
     for _, module in diffusion_model.named_modules():
         if isinstance_str(module, "ToMeBlock"):
@@ -432,3 +498,12 @@ def remove_patch(model: torch.nn.Module):
             module.__class__ = module._parent
 
     return model
+
+
+def get_logged_feature_maps(model: torch.nn.Module, file_name: str = "outputs/model_outputs.npz"):
+    logging.debug(f"\033[96mLogging Feature Map\033[0m")
+    numpy_feature_maps = {str(k): [fm.cpu().numpy() if isinstance(fm, torch.Tensor) else fm for fm in v] for k, v in model._bus.model_outputs.items()}
+    np.savez(file_name, **numpy_feature_maps)
+
+    numpy_feature_maps = {str(k): [fm.cpu().numpy() if isinstance(fm, torch.Tensor) else fm for fm in v] for k, v in model._bus.model_outputs_change.items()}
+    np.savez("outputs/model_outputs_change.npz", **numpy_feature_maps)
