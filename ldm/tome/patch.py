@@ -6,7 +6,6 @@ import torch
 import numpy as np
 import math
 from .merge import *
-from typing import Type, Dict, Any, Tuple, Callable, List, Optional
 from .utils import isinstance_str, init_generator
 
 
@@ -20,7 +19,16 @@ class CacheBus:
         self.prev_fm = None
         self.prev_prev_fm = None
         self.temporal_score = None
-        self.step = 1  # todo untested, just because dpm 2M starts from 2
+        self.step = 1  # todo untested, just because dpm++ 2M starts from 2
+
+        # save functions calculated for given step
+        self.m_a = None # todo untested
+        self.u_a = None
+
+        # indicator for re-calculation
+        self.ind_step = None # todo untested
+        self.ind_dim = None
+
 
 
 class Cache:
@@ -36,13 +44,13 @@ class Cache:
 
     # == 1. Cache Merge Operations == #
     def push(self, x: torch.Tensor, index: torch.Tensor = None) -> None:
-        if self.feature_map is None:
+        if index is None:
             # x would be the entire feature map during the first cache update
-            self.feature_map = x.clone()
+            self.feature_map = x
             if DEBUG_MODE: print(f"\033[96mCache Push\033[0m: Initial push x: \033[95m{x.shape}\033[0m to cache index: \033[91m{self.index}\033[0m")
         else:
             # x would be the dst (updated) tokens during subsequent cache updates
-            self.feature_map.scatter_(dim=-2, index=index, src=x.clone())
+            self.feature_map.scatter_(dim=-2, index=index, src=x)
             if DEBUG_MODE: print(f"\033[96mCache Push\033[0m: Push x: \033[95m{x.shape}\033[0m to cache index: \033[91m{self.index}\033[0m")
 
     def pop(self, index: torch.Tensor) -> torch.Tensor:
@@ -52,7 +60,12 @@ class Cache:
         return x
 
 
-def compute_merge(x: torch.Tensor, mode:str, tome_info: Dict[str, Any], cache: Cache) -> Tuple[Callable, ...]:
+
+def compute_prune(x: torch.Tensor, mode:str, tome_info: Dict[str, Any], cache: Cache) -> Tuple[Callable, ...]:
+    """
+    Optimized to avoid re-calculation of pruning and reconstruction function
+    """
+
     original_h, original_w = tome_info["size"]
     original_tokens = original_h * original_w
     downsample = int(math.ceil(math.sqrt(original_tokens // x.shape[1])))
@@ -61,36 +74,48 @@ def compute_merge(x: torch.Tensor, mode:str, tome_info: Dict[str, Any], cache: C
 
     if (args['deep_cache'] and (downsample <= args["max_downsample"] and (cache.index in (0, 13, 14)))) or \
             (not args['deep_cache'] and downsample <= args["max_downsample"]):
-        w = int(math.ceil(original_w / downsample))
-        h = int(math.ceil(original_h / downsample))
-        r = int(x.shape[1] * args["ratio"])
+        if cache.cache_bus.ind_step == cache.step:
+            m, u = cache.cache_bus.m_a, cache.cache_bus.u_a
 
-        # Re-init the generator if it hasn't already been initialized or device has changed.
-        if args["generator"] is None:
-            args["generator"] = init_generator(x.device)
-        elif args["generator"].device != x.device:
-            args["generator"] = init_generator(x.device, fallback=args["generator"])
-
-        # If the batch size is odd, then it's not possible for prompted and unprompted images to be in the same
-        # batch, which causes artifacts with use_rand, so force it to be off.
-        use_rand = False if x.shape[0] % 2 == 1 else args["use_rand"]
-
-        # retrieve semi-random merging schedule
-        if mode == 'cache_merge':
-            if cache.rand_indices is None:
-                cache.rand_indices = cache.cache_bus.rand_indices[cache.index].copy()
-            rand_indices = cache.rand_indices
         else:
-            rand_indices = None
+            # Update indicator
+            cache.cache_bus.ind_step = cache.step
 
-        # the function defines the indices to merge and unmerge
-        m, u = bipartite_soft_matching_random2d(x, w, h, args["sx"], args["sy"], r, tome_info,
-                                              no_rand=not use_rand, unmerge_mode=mode,
-                                              cache=cache, rand_indices=rand_indices, generator=args["generator"],)
+            w = int(math.ceil(original_w / downsample))
+            h = int(math.ceil(original_h / downsample))
+            r = int(x.shape[1] * args["ratio"])
+
+            # Re-init the generator if it hasn't already been initialized or device has changed.
+            if args["generator"] is None:
+                args["generator"] = init_generator(x.device)
+            elif args["generator"].device != x.device:
+                args["generator"] = init_generator(x.device, fallback=args["generator"])
+
+            # If the batch size is odd, then it's not possible for prompted and unprompted images to be in the same
+            # batch, which causes artifacts with use_rand, so force it to be off.
+            use_rand = False if x.shape[0] % 2 == 1 else args["use_rand"]
+
+            # retrieve semi-random merging schedule
+            if mode == 'cache_merge_deprecated':
+                if cache.rand_indices is None:
+                    cache.rand_indices = cache.cache_bus.rand_indices[cache.index].copy()
+                rand_indices = cache.rand_indices
+            else:
+                rand_indices = None
+
+            # the function defines the indices to prune
+            m, u = bipartite_soft_matching_random2d(x, w, h, args["sx"], args["sy"], r, tome_info,
+                                                    no_rand=not use_rand, unmerge_mode=mode,
+                                                    cache=cache, rand_indices=rand_indices,
+                                                    generator=args["generator"], )
+
+            cache.cache_bus.m_a, cache.cache_bus.u_a= m, u
+
     else:
         m, u = (do_nothing, do_nothing)
 
     return m, u
+
 
 
 def patch_solver(solver_class):
@@ -191,8 +216,8 @@ def patch_solver(solver_class):
                     # score = (diff >= 0.15 * m1.abs().mean()).float() # here the metric is a single real number
 
                     # Calculate the dynamic threshold value
-                    threshold_value = 0.05 * m1.abs().mean()
-                    threshold_num = 1024*5
+                    threshold_value = 0.15 * m1.abs().mean()
+                    threshold_num = 1024*4
 
                     diff_flat = diff.view(-1)
                     mask = diff_flat >= threshold_value
@@ -227,6 +252,7 @@ def patch_solver(solver_class):
     return PatchedDPMSolverMultistepScheduler
 
 
+
 def make_tome_block(block_class: Type[torch.nn.Module], mode: str = 'token_merge') -> Type[torch.nn.Module]:
     class ToMeBlock(block_class):
         # Save for unpatching later
@@ -234,7 +260,7 @@ def make_tome_block(block_class: Type[torch.nn.Module], mode: str = 'token_merge
         _mode = mode
 
         def _forward(self, x: torch.Tensor, context: torch.Tensor = None) -> torch.Tensor:
-            m_a, u_a = compute_merge(x, self._mode, self._tome_info, self._cache)
+            m_a, u_a = compute_prune(x, self._mode, self._tome_info, self._cache)
 
             x = u_a(self.attn1(m_a(self.norm1(x), prune=self._tome_info['args']['prune']), context=context if self.disable_self_attn else None)) + x
             x = self.attn2(self.norm2(x), context=context) + x
@@ -244,6 +270,7 @@ def make_tome_block(block_class: Type[torch.nn.Module], mode: str = 'token_merge
             return x
 
     return ToMeBlock
+
 
 
 def make_diffusers_tome_block(block_class: Type[torch.nn.Module], mode: str = 'token_merge') -> Type[torch.nn.Module]:
@@ -263,7 +290,8 @@ def make_diffusers_tome_block(block_class: Type[torch.nn.Module], mode: str = 't
                 class_labels=None,
         ) -> torch.Tensor:
             # (1) ToMe
-            m_a, u_a = compute_merge(hidden_states, self._mode, self._tome_info, self._cache)
+            m_a, u_a = compute_prune(hidden_states, self._mode, self._tome_info, self._cache)
+            hidden_states = m_a(hidden_states, prune=self._tome_info['args']['prune'], cache=self._cache)
 
             if self.use_ada_layer_norm:
                 norm_hidden_states = self.norm1(hidden_states, timestep)
@@ -275,12 +303,11 @@ def make_diffusers_tome_block(block_class: Type[torch.nn.Module], mode: str = 't
                 norm_hidden_states = self.norm1(hidden_states)
 
             # (2) ToMe m_a
-            norm_hidden_states_ma = m_a(norm_hidden_states, prune=self._tome_info['args']['prune'])
 
             # 1. Self-Attention
             cross_attention_kwargs = cross_attention_kwargs if cross_attention_kwargs is not None else {}
             attn_output = self.attn1(
-                norm_hidden_states_ma,
+                norm_hidden_states,
                 encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
                 attention_mask=attention_mask,
                 **cross_attention_kwargs,
@@ -289,7 +316,7 @@ def make_diffusers_tome_block(block_class: Type[torch.nn.Module], mode: str = 't
                 attn_output = gate_msa.unsqueeze(1) * attn_output
 
             # (3) ToMe u_a
-            hidden_states = u_a(attn_output) + hidden_states
+            hidden_states = attn_output + hidden_states
 
             if self.attn2 is not None:
                 norm_hidden_states = (
@@ -318,11 +345,14 @@ def make_diffusers_tome_block(block_class: Type[torch.nn.Module], mode: str = 't
                 ff_output = gate_mlp.unsqueeze(1) * ff_output
             hidden_states = ff_output + hidden_states
 
+            hidden_states = u_a(hidden_states, cache=self._cache)
+
             self._cache.step += 1
 
             return hidden_states
 
     return ToMeBlock
+
 
 
 def hook_tome_model(model: torch.nn.Module):
@@ -333,6 +363,7 @@ def hook_tome_model(model: torch.nn.Module):
         return None
 
     model._tome_info["hooks"].append(model.register_forward_pre_hook(hook))
+
 
 
 def generate_semi_random_indices(sy: int, sx: int, h: int, w: int, steps: int) -> list:
@@ -357,6 +388,7 @@ def generate_semi_random_indices(sy: int, sx: int, h: int, w: int, steps: int) -
     return rand_idx
 
 
+
 def reset_cache(model: torch.nn.Module):
     is_diffusers = isinstance_str(model, "DiffusionPipeline") or isinstance_str(model, "ModelMixin")
     if not is_diffusers:
@@ -377,6 +409,7 @@ def reset_cache(model: torch.nn.Module):
             index += 1
     print(f"Reset cache for {index} BasicTransformerBlock")
     return model
+
 
 
 def apply_patch(
@@ -400,7 +433,7 @@ def apply_patch(
     if DEBUG_MODE: print('Start with \033[95mDEBUG\033[0m mode')
     print('\033[94mApplying Token Merging\033[0m')
 
-    cache_start = max(cache_step[0], 1)  # Make sure the first step is token merging to avoid cache access
+    cache_start = max(cache_step[0], 1)  # Make sure to avoid cache access in the first step
 
     # Make sure the module is not currently patched
     remove_patch(model)
@@ -483,6 +516,7 @@ def apply_patch(
     return model
 
 
+
 def remove_patch(model: torch.nn.Module):
     """ Removes a patch from a ToMe Diffusion module if it was already patched. """
     # For diffusers
@@ -500,6 +534,7 @@ def remove_patch(model: torch.nn.Module):
     return model
 
 
+
 def get_logged_feature_maps(model: torch.nn.Module, file_name: str = "outputs/model_outputs.npz"):
     logging.debug(f"\033[96mLogging Feature Map\033[0m")
     numpy_feature_maps = {str(k): [fm.cpu().numpy() if isinstance(fm, torch.Tensor) else fm for fm in v] for k, v in model._bus.model_outputs.items()}
@@ -507,3 +542,98 @@ def get_logged_feature_maps(model: torch.nn.Module, file_name: str = "outputs/mo
 
     numpy_feature_maps = {str(k): [fm.cpu().numpy() if isinstance(fm, torch.Tensor) else fm for fm in v] for k, v in model._bus.model_outputs_change.items()}
     np.savez("outputs/model_outputs_change.npz", **numpy_feature_maps)
+
+
+
+# class Cache:
+#     def __init__(self, index: int, cache_bus: CacheBus, broadcast_range: int = 1):
+#         self.cache_bus = cache_bus
+#
+#         self.feature_map = None
+#         self.hsy = None
+#         self.wsx = None
+#         self.sy_sx = None
+#
+#         self.index = index
+#         self.rand_indices = None
+#         self.step = 0
+#
+#     # == 1. Cache Merge Operations == #
+#     def push(self, x: torch.Tensor, index: torch.Tensor = None) -> None:
+#         """
+#         Pushes preserved patches to the cache.
+#
+#         Args:
+#             x (torch.Tensor): Tensor of preserved patches with shape [B, N_p, C],
+#                               where N_p = number of preserved patches * sy * sx.
+#             index (torch.Tensor): Tensor of patch indices with shape [num_preserved_patches, 3],
+#                                    where each row is [Batch_idx, hsy_idx, wsx_idx].
+#         """
+#         if self.feature_map is None:
+#             # Initialize the feature_map tensor to store preserved patches
+#             self.feature_map = x
+#
+#             if DEBUG_MODE:
+#                 print(f"\033[96mCache Push\033[0m: Initialized feature_map with shape {self.feature_map.shape}")
+#
+#             return
+#
+#         if self.hsy is None and index is not None:
+#             # Extract dimensions from index
+#             B = self.feature_map.shape[0]
+#             hsy = index[:, 1].max().item() + 1  # Number of patches along height
+#             wsx = index[:, 2].max().item() + 1  # Number of patches along width
+#             sy_sx = self.feature_map.shape[1] // (hsy * wsx)  # Tokens per patch (sy * sx)
+#
+#             self.hsy = hsy
+#             self.wsx = wsx
+#             self.sy_sx = sy_sx
+#
+#             self.feature_map = self.feature_map.reshape([B, hsy, wsx, sy_sx, -1])
+#
+#         # Extract batch and patch indices
+#         hsy_idx = index[:, 1]    # Shape: [num_preserved_patches]
+#         wsx_idx = index[:, 2]    # Shape: [num_preserved_patches]
+#         num_preserved_patches = hsy_idx.shape[0]
+#
+#         # Validate indices
+#         if (hsy_idx.max() >= self.hsy) or (wsx_idx.max() >= self.wsx):
+#             raise IndexError("Patch indices exceed initialized feature_map dimensions.")
+#
+#         # Assign preserved patches to the feature_map
+#         self.feature_map[:, hsy_idx, wsx_idx, :, :] = x.view(2, num_preserved_patches, self.sy_sx, -1)
+#
+#         if DEBUG_MODE:
+#             print(f"\033[96mCache Push\033[0m: Pushed patches to cache index: {self.index}")
+#
+#         return
+#
+#     def pop(self, index: torch.Tensor) -> torch.Tensor:
+#         """
+#         Retrieves pruned patches from the cache.
+#
+#         Args:
+#             index (torch.Tensor): Tensor of patch indices with shape [num_pruned_patches, 3],
+#                                    where each row is [Batch_idx, hsy_idx, wsx_idx].
+#
+#         Returns:
+#             torch.Tensor: Tensor of retrieved patches with shape [B, num_pruned_patches * sy * sx, C].
+#         """
+#         if self.feature_map is None:
+#             raise RuntimeError("Feature map is empty. Cannot pop from cache.")
+#
+#         # Extract batch and patch indices
+#         hsy_idx = index[:, 1]    # Shape: [num_pruned_patches]
+#         wsx_idx = index[:, 2]    # Shape: [num_pruned_patches]
+#
+#         # Validate indices
+#         if (hsy_idx.max() >= self.hsy) or (wsx_idx.max() >= self.wsx):
+#             raise IndexError("Patch indices exceed initialized feature_map dimensions.")
+#
+#         # Retrieve pruned patches from the feature_map
+#         pruned_patches = self.feature_map[:, hsy_idx, wsx_idx, :, :]  # Shape: [B, sy*sx, C]
+#
+#         if DEBUG_MODE:
+#             print(f"\033[96mCache Pop\033[0m: Popped patches from cache index: {self.index}")
+#
+#         return pruned_patches

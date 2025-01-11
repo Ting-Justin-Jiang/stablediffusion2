@@ -1,12 +1,15 @@
 import torch
-from typing import Tuple, Callable
+from typing import Type, Dict, Any, Tuple, Callable, List, Optional, Union
 import logging
+import torch.nn.functional as F
+import math
 
 import os
 
 os.environ['CUDA_LAUNCH_BLOCKING']='1'
+DEBUG_MODE = True
 
-def do_nothing(x: torch.Tensor, mode: str = None, prune: bool = None, unmerge_mode = None):
+def do_nothing(x: torch.Tensor, mode: str = None, prune: bool = None, unmerge_mode = None, cache=None):
     """
     A versatile placeholder...
     """
@@ -24,6 +27,39 @@ def mps_gather_workaround(input, dim, index):
         return torch.gather(input, dim, index)
 
 
+def interpolate_temporal_score(temporal_score: torch.Tensor, target_length: int) -> torch.Tensor:
+    """
+    Deprecated: need to revise to take in rectangular shapes
+    """
+    # Ensure the input tensor has the correct shape
+    assert temporal_score.dim() == 3 and temporal_score.shape[0] == 1, \
+        "temporal_score must have shape [1, N, 1]"
+
+    N = temporal_score.shape[1]
+    H = W = int(math.sqrt(N))
+    assert H * W == N, "The spatial dimensions must form a square."
+
+    # Calculate target spatial dimensions
+    target_size = int(math.sqrt(target_length))
+    assert target_size * target_size == target_length, \
+        "target_length must be a perfect square."
+    assert H % target_size == 0 and W % target_size == 0, \
+        "target_length must be compatible with the original dimensions."
+
+    factor = H // target_size  # Downscaling factor per spatial dimension
+
+    x = temporal_score.view(1, 1, H, W).float() # Reshape to [1, 1, H, W] for pooling
+    pooled = F.avg_pool2d(x, kernel_size=factor, stride=factor)
+
+    # Determine the threshold. More than half means > 0.5 for binary data
+    interpolated = (pooled > 0.5).long()
+
+    # Reshape back to [1, target_length, 1]
+    interpolated = interpolated.view(1, target_length, 1)
+
+    return interpolated
+
+
 def deprecated_bipartite_soft_matching_random2d(metric: torch.Tensor,
                                      w: int, h: int, sx: int, sy: int, r: int,
                                      tome_info: dict,
@@ -33,6 +69,10 @@ def deprecated_bipartite_soft_matching_random2d(metric: torch.Tensor,
                                      rand_indices: list = None,
                                      generator: torch.Generator = None
                                      ) -> Tuple[Callable, Callable]:
+
+    """
+    Core algorithm - V1
+    """
     B, N, _ = metric.shape
 
     if r <= 0:
@@ -41,9 +81,10 @@ def deprecated_bipartite_soft_matching_random2d(metric: torch.Tensor,
     # # Force stop (In most case, broadcast_start < cache_start
     if cache.step < tome_info['args']['merge_start'] or cache.step > tome_info['args']['merge_end']:
         if cache.step == tome_info['args']['merge_start'] - 1 and unmerge_mode == 'cache_merge':
-            def initial_push(x: torch.Tensor):
-                        cache.push(x)
-                        return x
+            def initial_push(x: torch.Tensor, cache=cache):
+                cache.push(x)
+                return x
+
             return do_nothing, initial_push
         else:
             return do_nothing, do_nothing
@@ -57,7 +98,7 @@ def deprecated_bipartite_soft_matching_random2d(metric: torch.Tensor,
         if no_rand:
             rand_idx = torch.zeros(hsy, wsx, 1, device=metric.device, dtype=torch.int64)
         else:
-            if unmerge_mode == 'cache_merge':
+            if unmerge_mode == 'cache_merge_deprecated':
                 # retrieve from a pre-defined semi-random schedule
                 rand_idx = rand_indices.pop().to(generator.device)
             else:
@@ -108,7 +149,7 @@ def deprecated_bipartite_soft_matching_random2d(metric: torch.Tensor,
         src_idx = edge_idx[..., :r, :]  # Merged Tokens
         dst_idx = gather(node_idx[..., None], dim=-2, index=src_idx)  # dst indices src tokens should merge to
 
-    def merge(x: torch.Tensor, mode="mean", prune=False) -> torch.Tensor:
+    def merge(x: torch.Tensor, mode="mean", prune=False, cache=cache) -> torch.Tensor:
         src, dst = split(x)
         n, t1, c = src.shape
 
@@ -124,7 +165,7 @@ def deprecated_bipartite_soft_matching_random2d(metric: torch.Tensor,
                       f"at block index: \033[91m{cache.index}\033[0m")
         return out
 
-    def unmerge(x: torch.Tensor, unmerge_mode=unmerge_mode) -> torch.Tensor:
+    def unmerge(x: torch.Tensor, unmerge_mode=unmerge_mode, cache=cache) -> torch.Tensor:
         unm_len = unm_idx.shape[1]
         unm, dst = x[..., :unm_len, :], x[..., unm_len:, :]
         _, _, c = unm.shape
@@ -175,86 +216,79 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
     Core algorithm - V2
     """
 
+    def push_all(x: torch.Tensor, cache=cache):
+        cache.push(x)
+        return x
+
     B, N, _ = metric.shape
 
     if r <= 0:
         return do_nothing, do_nothing
 
     if cache.step < tome_info['args']['merge_start'] or cache.step > tome_info['args']['merge_end']:
-        if cache.step == tome_info['args']['merge_start'] - 1 and unmerge_mode == 'cache_merge':
-            def initial_push(x: torch.Tensor):
-                cache.push(x)
-                return x
-
-            return do_nothing, initial_push
-        else:
-            return do_nothing, do_nothing
-
+        return do_nothing, do_nothing
+    elif (cache.step - tome_info['args']['merge_start']) % 3 == 0:
+        return do_nothing, push_all
 
     gather = mps_gather_workaround if metric.device.type == "mps" else torch.gather
-
     with torch.no_grad():
         hsy, wsx = h // sy, w // sx
-        h_crop, w_crop = hsy * sy, wsx * sx
 
-        # Generate random indices for destination tokens within each kernel
+        # For each sy by sx kernel, randomly assign one token to be dst and the rest src
         if no_rand:
-            rand_idx = torch.zeros(hsy, wsx, 1, dtype=torch.int32, device=metric.device)
+            rand_idx = torch.zeros(hsy, wsx, 1, device=metric.device, dtype=torch.int64)
         else:
-            rand_idx = (rand_indices.pop().to(metric.device) if unmerge_mode == 'cache_merge'
-                else torch.randint(sy * sx, (hsy, wsx, 1), generator=generator, device=metric.device)
-            )
+            if unmerge_mode == 'cache_merge_deprecated':
+                # retrieve from a pre-defined semi-random schedule
+                rand_idx = rand_indices.pop().to(generator.device)
+            else:
+                rand_idx = torch.randint(sy * sx, size=(hsy, wsx, 1), device=generator.device, generator=generator).to(
+                    metric.device)
 
-        # Create a grid of indices representing the image pixels
-        idx_grid = torch.arange(h_crop * w_crop, device=metric.device).reshape(h_crop, w_crop)
+        # The image might not divide sx and sy, so we need to work on a view of the top left if the idx buffer instead
+        idx_buffer_view = torch.zeros(hsy, wsx, sy * sx, device=metric.device, dtype=torch.int64)
+        idx_buffer_view.scatter_(dim=2, index=rand_idx, src=-torch.ones_like(rand_idx, dtype=rand_idx.dtype))
+        idx_buffer_view = idx_buffer_view.view(hsy, wsx, sy, sx).transpose(1, 2).reshape(hsy * sy, wsx * sx)
 
-        # Reshape indices to match kernel blocks
-        idx_flat = idx_grid.reshape(hsy, sy, wsx, sx).permute(0, 2, 1, 3).reshape(hsy, wsx, sy * sx)
+        # Image is not divisible by sx or sy so we need to move it into a new buffer
+        if (hsy * sy) < h or (wsx * sx) < w:
+            idx_buffer = torch.zeros(h, w, device=metric.device, dtype=torch.int64)
+            idx_buffer[:(hsy * sy), :(wsx * sx)] = idx_buffer_view
+        else:
+            idx_buffer = idx_buffer_view
 
-        # Identify destination indices and mark them in idx_flat
-        b_idx = idx_flat.gather(2, rand_idx).view(-1)
-        idx_flat.scatter_(2, rand_idx, -1)
+        # We set dst tokens to be -1 and src to be 0, so an argsort gives us dst|src indices
+        rand_idx = idx_buffer.reshape(1, -1, 1).argsort(dim=1)
 
-        # Extract source indices directly from idx_flat without creating a mask
-        a_idx = idx_flat[idx_flat != -1]
+        # We're finished with these
+        del idx_buffer, idx_buffer_view
 
-        # Handle extra pixels if the image dimensions are not divisible by sy or sx
-        if h_crop < h:
-            extra_rows = idx_grid[h_crop:, :w_crop].flatten()
-            src_idx = torch.cat((a_idx, extra_rows), dim=0)
-        if w_crop < w:
-            extra_cols = idx_grid[:h_crop, w_crop:].flatten()
-            src_idx = torch.cat((a_idx, extra_cols), dim=0)
-        if h_crop < h and w_crop < w:
-            corner_pixels = idx_grid[h_crop:, w_crop:].flatten()
-            src_idx = torch.cat((a_idx, corner_pixels), dim=0)
-
-        a_idx = a_idx.view(1, -1, 1) # src
-        b_idx = b_idx.view(1, -1, 1) # dst
+        # rand_idx is currently dst|src, so split them
+        num_dst = hsy * wsx  # this assumes we only choose one dst from a grid
+        a_idx = rand_idx[:, num_dst:, :]  # src
+        b_idx = rand_idx[:, :num_dst, :]  # dst
 
         # rand_idx is currently dst|src, so split them
         num_dst = hsy * wsx # this assumes we only choose one dst from a grid
-        temporal_score = cache.cache_bus.temporal_score.clone().reshape(1, -1, 1)
+        temporal_score = cache.cache_bus.temporal_score.reshape(1, -1, 1)
 
-        # # todo: untested 1
+        if temporal_score.shape[1] != N:
+            temporal_score = interpolate_temporal_score(temporal_score, N)
+
         # Flatten the tensors for efficient computation
         a_idx_flat = a_idx.view(-1)  # Shape: [6912]
         b_idx_flat = b_idx.view(-1)  # Shape: [2304]
         score_flat = temporal_score.view(-1)  # Shape: [9216]
 
-        # Create a boolean mask for indices in b_idx_flat
         b_mask = torch.zeros(score_flat.size(0), dtype=torch.bool, device=temporal_score.device)
-        b_mask[b_idx_flat] = True  # Mark indices present in b_idx_flat
+        b_mask[b_idx_flat] = True
 
         # Identify indices in a_idx_flat to move to b_idx_flat
         move_mask = (score_flat[a_idx_flat] == 1) & (~b_mask[a_idx_flat])
         indices_to_move = a_idx_flat[move_mask]
 
-        # Update a_idx_flat by removing indices_to_move
-        a_idx_flat = a_idx_flat[~move_mask]
-
-        # Update b_idx_flat by adding indices_to_move
-        b_idx_flat = torch.cat([b_idx_flat, indices_to_move])
+        a_idx_flat = a_idx_flat[~move_mask] # Update a_idx_flat by removing indices_to_move
+        b_idx_flat = torch.cat([b_idx_flat, indices_to_move]) # Update b_idx_flat by adding indices_to_move
 
         # Reshape back to original dimensions
         a_idx = a_idx_flat.view(1, -1, 1)  # Updated a_idx
@@ -275,7 +309,7 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
         unm_idx = torch.tensor([], device=metric.device, dtype=torch.long).view(1, 0, 1)  # No unmerged tokens
 
 
-    def prune(x: torch.Tensor, prune=False) -> torch.Tensor:
+    def prune(x: torch.Tensor, prune=False, cache=cache) -> torch.Tensor:
         src, dst = split(x)
         n, t1, c = src.shape
 
@@ -286,7 +320,7 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
         print(f"\033[96mMerge\033[0m: feature map merged from \033[95m{x.shape}\033[0m to \033[95m{out.shape}\033[0m "f"at block index: \033[91m{cache.index}\033[0m")
         return out
 
-    def reconstruct(x: torch.Tensor, unmerge_mode=unmerge_mode) -> torch.Tensor:
+    def reconstruct(x: torch.Tensor, unmerge_mode=unmerge_mode, cache=cache) -> torch.Tensor:
         unm_len = unm_idx.shape[1]
         unm, dst = x[..., :unm_len, :], x[..., unm_len:, :]
         _, _, c = unm.shape
@@ -304,5 +338,85 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
         out.scatter_(dim=-2, index=gather(a_idx.expand(B, a_idx.shape[1], 1), dim=1, index=src_idx).expand(B, r, c), src=src)
 
         return out
+
+    return prune, reconstruct
+
+
+
+def v3_bipartite_soft_matching_random2d(metric: torch.Tensor,
+                                     w: int, h: int, sx: int, sy: int, r: int,
+                                     tome_info: dict,
+                                     no_rand: bool = False,
+                                     unmerge_mode: str = 'token_merge',
+                                     cache: any = None,
+                                     rand_indices: list = None,
+                                     generator: torch.Generator = None
+                                     ) -> Tuple[Callable, Callable]:
+    """
+    Core algorithm - V3 - deprecated
+    """
+
+    B, N, C = metric.shape
+
+    if r <= 0:
+        return do_nothing, do_nothing
+
+    if cache.step < tome_info['args']['merge_start'] or cache.step > tome_info['args']['merge_end']:
+        if cache.step == tome_info['args']['merge_start'] - 1 and unmerge_mode == 'cache_merge':
+            def initial_push(x: torch.Tensor):
+                cache.push(x)
+                return x
+            return do_nothing, initial_push
+        else:
+            return do_nothing, do_nothing
+
+
+    gather = mps_gather_workaround if metric.device.type == "mps" else torch.gather
+
+    with torch.no_grad():
+        hsy, wsx = h // sy, w // sx
+
+        # Reshape temporal_score to [1, hsy, wsx, sy * sx]
+        temporal_score = cache.cache_bus.temporal_score.reshape(1, hsy, wsx, sy * sx)  # Shape: [1, hsy, wsx, sy*sx]
+
+        tokens_per_patch = sx * sy
+        half_tokens = tokens_per_patch // 2
+        active_tokens = (temporal_score.sum(dim=-1) >= half_tokens).float()  # Shape: [1, hsy, wsx]
+        preserve_patches = active_tokens.bool()  # Shape: [1, hsy, wsx]
+
+        # Create a mask for tokens to preserve
+        preserve_patches_expanded = preserve_patches.unsqueeze(-1).expand(-1, -1, -1, sy * sx)  # [1, hsy, wsx, sy*sx]
+        preserve_mask = preserve_patches_expanded.reshape(1, hsy * wsx * sy * sx)  # [1, N]
+
+        # Apply the mask to prune the metric
+        pruned_x = metric[:, preserve_mask.squeeze(0), :]  # [B, N_p, C]
+
+        # Store patch indices for reconstruction
+        preserved_patch_indices = preserve_patches.nonzero(as_tuple=False)  # [num_preserved_patches, 3] (Batch_idx, hsy_idx, wsx_idx)
+        pruned_patches = ~preserve_patches  # Logical NOT to get pruned patches
+        pruned_patch_indices = pruned_patches.nonzero(as_tuple=False)  # [num_pruned_patches, 3] (Batch_idx, hsy_idx, wsx_idx)
+
+    def prune(x: torch.Tensor, prune=False) -> torch.Tensor:
+        print(pruned_x.shape)
+        return pruned_x
+
+    def reconstruct(x: torch.Tensor, unmerge_mode=unmerge_mode) -> torch.Tensor:
+        cache.push(x, preserved_patch_indices)
+        cached_patches = cache.pop(pruned_patch_indices)  # [B, num_pruned_patches * sy * sx, C]
+
+        # Initialize an empty tensor for the reconstructed metric
+        reconstructed_metric = torch.zeros_like(metric)  # [B, N, C]
+
+        # Create pruned_mask
+        pruned_mask = ~preserve_mask  # [1, N]
+
+        # Assign preserved tokens from x
+        reconstructed_metric[:, preserve_mask.squeeze(0), :] = x  # [B, N_p, C]
+
+        # Assign pruned tokens from cached_patches
+        reconstructed_metric[:, pruned_mask.squeeze(0), :] = cached_patches.view(B, -1, C)  # [B, N_p, C]
+
+        print(f"\033[96mReconstruct\033[0m: feature map reconstructed to shape \033[95m{reconstructed_metric.shape}\033[0m "f"at block index: \033[91m{cache.index}\033[0m")
+        return reconstructed_metric
 
     return prune, reconstruct
