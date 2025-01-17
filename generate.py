@@ -3,6 +3,7 @@ import argparse
 import numpy as np
 import random
 import math
+import lpips
 
 import os
 from tqdm import tqdm
@@ -36,39 +37,33 @@ def main(args):
 
     prompts = prompts[:args.num_fid_samples]
 
-    if args.original:
-        from diffusers import StableDiffusionPipeline
-        pipe = StableDiffusionPipeline.from_pretrained("stabilityai/stable-diffusion-2-1", torch_dtype=torch.float16, safety_checker=None).to("cuda:0")
-        if args.merge_ratio > 0.0:
-            patch.apply_patch(pipe,
-                              ratio=args.merge_ratio,
-                              mode=args.merge_mode,
-                              prune=args.prune,
-                              sx=2, sy=2,
-                              max_downsample=1,
-                              latent_size=(2 * math.ceil(768 / 16),
-                                           2 * math.ceil(768 / 16)),
-                              merge_step=args.merge_step,
-                              cache_step=args.cache_step,
-                              push_unmerged=args.push_unmerged,
-                              deep_cache=False)
-
+    if args.method != "deep_cache":
+        from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
+        pipe = StableDiffusionPipeline.from_pretrained(args.model, torch_dtype=torch.float16, safety_checker=None).to("cuda:0")
+        pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
     else:
+        from diffusers import DPMSolverMultistepScheduler
         from DeepCache.sd.pipeline_stable_diffusion import StableDiffusionPipeline
-        pipe = StableDiffusionPipeline.from_pretrained("stabilityai/stable-diffusion-2-1", torch_dtype=torch.float16).to("cuda:0")
-        if args.merge_ratio > 0.0:
-            patch.apply_patch(pipe,
-                              ratio=args.merge_ratio,
-                              mode=args.merge_mode,
-                              prune=args.prune,
-                              sx=2, sy=2,
-                              max_downsample=1,
-                              latent_size=(2 * math.ceil(768 / 16),
-                                           2 * math.ceil(768 / 16)),
-                              merge_step=args.merge_step,
-                              cache_step=args.cache_step,
-                              push_unmerged=args.push_unmerged,
-                              deep_cache=True)
+        pipe = StableDiffusionPipeline.from_pretrained(args.model, torch_dtype=torch.float16).to("cuda:0")
+
+    if args.merge_ratio > 0.0:
+        patch.apply_patch(pipe,
+                          ratio=args.merge_ratio,
+                          mode=args.merge_mode,
+                          prune=args.prune,
+                          sx=3, sy=3,
+                          max_downsample=1,
+                          latent_size=(2 * math.ceil(768 // 16),
+                                       2 * math.ceil(768 // 16)),
+                          merge_step=args.merge_step,
+                          cache_step=args.cache_step,
+                          push_unmerged=args.push_unmerged,
+
+                          threshold_map=args.threshold_map,
+                          threshold_token=args.threshold_token,
+                          max_fix=args.max_fix,
+                          cache_interval=args.cache_interval
+                          )
 
 
     # Initialize metric
@@ -78,19 +73,20 @@ def main(args):
     output_dir = args.experiment_folder
     os.makedirs(output_dir, exist_ok=True)
 
-    start_time = time.time()
     num_batch = len(prompts) // args.batch_size
     if len(prompts) % args.batch_size != 0:
         num_batch += 1
 
     global_image_index = 0  # Tracks unique image indices across batches
+    use_time = 0
 
     for i in tqdm(range(num_batch)):
         start, end = args.batch_size * i, min(args.batch_size * (i + 1), len(prompts))
         sample_prompts = [prompts[i]["Prompt"] for i in range(start, end)]
 
         set_random_seed(args.seed)
-        if args.original or args.bk:
+        start_time = time.time()
+        if args.method != "deep_cache":
             pipe_output = pipe(
                 sample_prompts, output_type='np', return_dict=True,
                 num_inference_steps=args.steps
@@ -103,7 +99,9 @@ def main(args):
                 uniform=args.uniform, pow=args.pow, center=args.center,
                 output_type='np', return_dict=True
             )
+        use_time += round(time.time() - start_time, 2)
         images = pipe_output.images
+
 
         # Inception Score & CLIP
         torch_images = torch.Tensor(images * 255).byte().permute(0, 3, 1, 2).contiguous()
@@ -121,7 +119,6 @@ def main(args):
         if args.merge_ratio > 0.0:
             patch.reset_cache(pipe)
 
-    use_time = round(time.time() - start_time, 2)
     print(f"Done: use_time = {use_time}")
     IS = inception.compute()
     CLIP = clip.compute()
@@ -132,7 +129,7 @@ def main(args):
         [args.target_folder, args.experiment_folder],
         1,
         "cuda:0",
-        dims=2048,
+        dims=768,
         num_workers=8,
     )
     print(f"FID: {fid_value}")
@@ -140,11 +137,18 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
+    # == Sampling setup ==
+    parser.add_argument("--model", type=str, default='stabilityai/stable-diffusion-2-1')
     parser.add_argument("--dataset", type=str, default="coco2017")
+    parser.add_argument("--steps", type=int, default=50)
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=3704)
+    parser.add_argument("--num-fid-samples", type=int, default=30)
+    parser.add_argument('--experiment-folder', type=str, default='samples/experiment/macap')
+    parser.add_argument('--target-folder', type=str, default='samples/data/val2017')
 
-    # For choosing baselines. If these two are not set, then it will use DeepCache.
-    parser.add_argument("--original", action="store_true")
-    parser.add_argument("--bk", type=str, default=None)
+    # == Acceleration Setup ==
+    parser.add_argument("--method", type=str, choices=["original", "deep_cache", "cap"], default="cap")
 
     # Hyperparameters for DeepCache
     parser.add_argument("--layer", type=int, default=0)
@@ -154,25 +158,19 @@ if __name__ == '__main__':
     parser.add_argument("--pow", type=float, default=1.4)
     parser.add_argument("--center", type=int, default=15)
 
-    # Hyperparameters for CAP
-    parser.add_argument("--merge-ratio", type=float, default=0.7)
-    parser.add_argument("--merge-metric", type=str, choices=["k", "x"], default="k")
-    parser.add_argument("--merge-mode", type=str, choices=["token_merge", "cache_merge"], default="token_merge")
-    parser.add_argument("--prune", action=argparse.BooleanOptionalAction, type=bool, default=False)
-    parser.add_argument("--merge-cond", action=argparse.BooleanOptionalAction, type=bool, default=False)
-
-    parser.add_argument("--merge-step", type=lambda s: (int(item) for item in s.split(',')), default=(0, 48))
-    parser.add_argument("--cache-step", type=lambda s: (int(item) for item in s.split(',')), default=(9, 48))
+    # Hyperparameters for CAP (old)
+    parser.add_argument("--merge-ratio", type=float, default=0.99)
+    parser.add_argument("--merge-mode", type=str, choices=["token_merge", "cache_merge"], default="cache_merge")
+    parser.add_argument("--prune", action=argparse.BooleanOptionalAction, type=bool, default=True)
+    parser.add_argument("--merge-step", type=lambda s: (int(item) for item in s.split(',')), default=(3, 49))
+    parser.add_argument("--cache-step", type=lambda s: (int(item) for item in s.split(',')), default=(3, 49))
     parser.add_argument("--push-unmerged", action=argparse.BooleanOptionalAction, type=bool, default=True)
 
-
-    # Sampling setup
-    parser.add_argument("--steps", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num-fid-samples", type=int, default=20)
-    parser.add_argument('--experiment-folder', type=str, default='samples/experiment/token_prune')
-    parser.add_argument('--target-folder', type=str, default='samples/data/val2017')
+    # Hyperparameters for MACAP (new)
+    parser.add_argument("--threshold-token", type=float, default=0.15)
+    parser.add_argument("--threshold-map", type=float, default=0.025)
+    parser.add_argument("--max-fix", type=int, default=1024 * 6)
+    parser.add_argument("--cache-interval", type=int, default=3)
 
     args = parser.parse_args()
     set_random_seed(args.seed)

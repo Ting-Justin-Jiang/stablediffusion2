@@ -27,7 +27,7 @@ def mps_gather_workaround(input, dim, index):
         return torch.gather(input, dim, index)
 
 
-def interpolate_temporal_score(temporal_score: torch.Tensor, target_length: int) -> torch.Tensor:
+def downsample_temporal_score(temporal_score: torch.Tensor, target_length: int) -> torch.Tensor:
     """
     Deprecated: need to revise to take in rectangular shapes
     """
@@ -51,8 +51,8 @@ def interpolate_temporal_score(temporal_score: torch.Tensor, target_length: int)
     x = temporal_score.view(1, 1, H, W).float() # Reshape to [1, 1, H, W] for pooling
     pooled = F.avg_pool2d(x, kernel_size=factor, stride=factor)
 
-    # Determine the threshold. More than half means > 0.5 for binary data
-    interpolated = (pooled > 0.5).long()
+    # Determine the threshold. More than half means > 0.25 for binary data
+    interpolated = (pooled > 0.25).long()
 
     # Reshape back to [1, target_length, 1]
     interpolated = interpolated.view(1, target_length, 1)
@@ -79,8 +79,8 @@ def deprecated_bipartite_soft_matching_random2d(metric: torch.Tensor,
         return do_nothing, do_nothing
 
     # # Force stop (In most case, broadcast_start < cache_start
-    if cache.step < tome_info['args']['merge_start'] or cache.step > tome_info['args']['merge_end']:
-        if cache.step == tome_info['args']['merge_start'] - 1 and unmerge_mode == 'cache_merge':
+    if cache.cache_bus.step < tome_info['args']['merge_start'] or cache.cache_bus.step > tome_info['args']['merge_end']:
+        if cache.cache_bus.step == tome_info['args']['merge_start'] - 1 and unmerge_mode == 'cache_merge':
             def initial_push(x: torch.Tensor, cache=cache):
                 cache.push(x)
                 return x
@@ -170,7 +170,7 @@ def deprecated_bipartite_soft_matching_random2d(metric: torch.Tensor,
         unm, dst = x[..., :unm_len, :], x[..., unm_len:, :]
         _, _, c = unm.shape
 
-        if unmerge_mode == 'cache_merge' and tome_info['args']['cache_start'] <= cache.step <= tome_info['args']['cache_end']:
+        if unmerge_mode == 'cache_merge' and tome_info['args']['cache_start'] <= cache.cache_bus.step <= tome_info['args']['cache_end']:
             # == Branch 1: Improved Merging middle steps
             cache.push(dst, index=b_idx.expand(B, num_dst, c))
             if tome_info['args']['push_unmerged']:
@@ -225,10 +225,15 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
     if r <= 0:
         return do_nothing, do_nothing
 
-    if cache.step < tome_info['args']['merge_start'] or cache.step > tome_info['args']['merge_end']:
+    if cache.cache_bus.step < tome_info['args']['merge_start'] or cache.cache_bus.step > tome_info['args']['merge_end']:
         return do_nothing, do_nothing
-    elif (cache.step - tome_info['args']['merge_start']) % 3 == 0:
-        return do_nothing, push_all
+    else:
+        if tome_info['args']['merge_start'] > cache.cache_bus.last_skip_step and (
+                cache.cache_bus.step - tome_info['args']['merge_start']) % tome_info['args']['cache_interval'] == 0:
+            return do_nothing, push_all
+        elif tome_info['args']['merge_start'] <= cache.cache_bus.last_skip_step and (
+                cache.cache_bus.step - cache.cache_bus.last_skip_step - 1) % tome_info['args']['cache_interval'] == 0: # should be off by one
+            return do_nothing, push_all
 
     gather = mps_gather_workaround if metric.device.type == "mps" else torch.gather
     with torch.no_grad():
@@ -273,7 +278,7 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
         temporal_score = cache.cache_bus.temporal_score.reshape(1, -1, 1)
 
         if temporal_score.shape[1] != N:
-            temporal_score = interpolate_temporal_score(temporal_score, N)
+            temporal_score = downsample_temporal_score(temporal_score, N)
 
         # Flatten the tensors for efficient computation
         a_idx_flat = a_idx.view(-1)  # Shape: [6912]
@@ -293,6 +298,9 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
         # Reshape back to original dimensions
         a_idx = a_idx_flat.view(1, -1, 1)  # Updated a_idx
         b_idx = b_idx_flat.view(1, -1, 1)  # Updated b_idx
+
+        # update the b_idx
+        cache.cache_bus.b_idx = b_idx
 
         # Update r and num_dst based on new shapes
         r = a_idx.size(1)
@@ -325,7 +333,7 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
         unm, dst = x[..., :unm_len, :], x[..., unm_len:, :]
         _, _, c = unm.shape
 
-        if unmerge_mode == 'cache_merge' and tome_info['args']['cache_start'] <= cache.step <= tome_info['args']['cache_end']:
+        if unmerge_mode == 'cache_merge' and tome_info['args']['cache_start'] <= cache.cache_bus.step <= tome_info['args']['cache_end']:
             cache.push(dst, index=b_idx.expand(B, num_dst, c))
             src = cache.pop(index=gather(a_idx.expand(B, a_idx.shape[1], 1), dim=1, index=src_idx).expand(B, r, c))
         else:
@@ -338,85 +346,5 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
         out.scatter_(dim=-2, index=gather(a_idx.expand(B, a_idx.shape[1], 1), dim=1, index=src_idx).expand(B, r, c), src=src)
 
         return out
-
-    return prune, reconstruct
-
-
-
-def v3_bipartite_soft_matching_random2d(metric: torch.Tensor,
-                                     w: int, h: int, sx: int, sy: int, r: int,
-                                     tome_info: dict,
-                                     no_rand: bool = False,
-                                     unmerge_mode: str = 'token_merge',
-                                     cache: any = None,
-                                     rand_indices: list = None,
-                                     generator: torch.Generator = None
-                                     ) -> Tuple[Callable, Callable]:
-    """
-    Core algorithm - V3 - deprecated
-    """
-
-    B, N, C = metric.shape
-
-    if r <= 0:
-        return do_nothing, do_nothing
-
-    if cache.step < tome_info['args']['merge_start'] or cache.step > tome_info['args']['merge_end']:
-        if cache.step == tome_info['args']['merge_start'] - 1 and unmerge_mode == 'cache_merge':
-            def initial_push(x: torch.Tensor):
-                cache.push(x)
-                return x
-            return do_nothing, initial_push
-        else:
-            return do_nothing, do_nothing
-
-
-    gather = mps_gather_workaround if metric.device.type == "mps" else torch.gather
-
-    with torch.no_grad():
-        hsy, wsx = h // sy, w // sx
-
-        # Reshape temporal_score to [1, hsy, wsx, sy * sx]
-        temporal_score = cache.cache_bus.temporal_score.reshape(1, hsy, wsx, sy * sx)  # Shape: [1, hsy, wsx, sy*sx]
-
-        tokens_per_patch = sx * sy
-        half_tokens = tokens_per_patch // 2
-        active_tokens = (temporal_score.sum(dim=-1) >= half_tokens).float()  # Shape: [1, hsy, wsx]
-        preserve_patches = active_tokens.bool()  # Shape: [1, hsy, wsx]
-
-        # Create a mask for tokens to preserve
-        preserve_patches_expanded = preserve_patches.unsqueeze(-1).expand(-1, -1, -1, sy * sx)  # [1, hsy, wsx, sy*sx]
-        preserve_mask = preserve_patches_expanded.reshape(1, hsy * wsx * sy * sx)  # [1, N]
-
-        # Apply the mask to prune the metric
-        pruned_x = metric[:, preserve_mask.squeeze(0), :]  # [B, N_p, C]
-
-        # Store patch indices for reconstruction
-        preserved_patch_indices = preserve_patches.nonzero(as_tuple=False)  # [num_preserved_patches, 3] (Batch_idx, hsy_idx, wsx_idx)
-        pruned_patches = ~preserve_patches  # Logical NOT to get pruned patches
-        pruned_patch_indices = pruned_patches.nonzero(as_tuple=False)  # [num_pruned_patches, 3] (Batch_idx, hsy_idx, wsx_idx)
-
-    def prune(x: torch.Tensor, prune=False) -> torch.Tensor:
-        print(pruned_x.shape)
-        return pruned_x
-
-    def reconstruct(x: torch.Tensor, unmerge_mode=unmerge_mode) -> torch.Tensor:
-        cache.push(x, preserved_patch_indices)
-        cached_patches = cache.pop(pruned_patch_indices)  # [B, num_pruned_patches * sy * sx, C]
-
-        # Initialize an empty tensor for the reconstructed metric
-        reconstructed_metric = torch.zeros_like(metric)  # [B, N, C]
-
-        # Create pruned_mask
-        pruned_mask = ~preserve_mask  # [1, N]
-
-        # Assign preserved tokens from x
-        reconstructed_metric[:, preserve_mask.squeeze(0), :] = x  # [B, N_p, C]
-
-        # Assign pruned tokens from cached_patches
-        reconstructed_metric[:, pruned_mask.squeeze(0), :] = cached_patches.view(B, -1, C)  # [B, N_p, C]
-
-        print(f"\033[96mReconstruct\033[0m: feature map reconstructed to shape \033[95m{reconstructed_metric.shape}\033[0m "f"at block index: \033[91m{cache.index}\033[0m")
-        return reconstructed_metric
 
     return prune, reconstruct

@@ -8,26 +8,50 @@ import math
 from .merge import *
 from .utils import isinstance_str, init_generator
 
+from diffusers.utils import USE_PEFT_BACKEND, BaseOutput, scale_lora_layers, unscale_lora_layers
+from dataclasses import dataclass
+
+
+@dataclass
+class UNet2DConditionOutput(BaseOutput):
+    sample: torch.FloatTensor = None
+
 
 class CacheBus:
     """A Bus class for overall control."""
     def __init__(self):
         self.rand_indices = {}  # key: index, value: rand_idx
-        # self.model_outputs = {}
-        # self.model_outputs_change = {}
 
+        # momentum awareness
         self.prev_fm = None
         self.prev_prev_fm = None
         self.temporal_score = None
-        self.step = 1  # todo untested, just because dpm++ 2M starts from 2
+        self.step = 0
+
+        # partial calculation of momentum
+        self.downsample = 1
+        self.b_idx = None
 
         # save functions calculated for given step
         self.m_a = None # todo untested
         self.u_a = None
 
         # indicator for re-calculation
+        self.c_step = 1 # todo untested, just because dpm++ 2M starts from 2
         self.ind_step = None # todo untested
-        self.ind_dim = None
+
+        # model-level accel
+        self.prev_momentum = None
+        self.last_skip_step = 0 # align with step in cache bus
+        self.skip_this_step = False
+        self.prev_sample = None
+
+        # remove comment to log
+        # self.model_outputs = {}
+        # self.model_outputs_change = {}
+        self.abs_momentum_list = []
+        self.rel_momentum_list = []
+        self.skipping_path = []
 
 
 
@@ -40,7 +64,6 @@ class Cache:
 
         self.index = index
         self.rand_indices = None
-        self.step = 0
 
     # == 1. Cache Merge Operations == #
     def push(self, x: torch.Tensor, index: torch.Tensor = None) -> None:
@@ -72,14 +95,14 @@ def compute_prune(x: torch.Tensor, mode:str, tome_info: Dict[str, Any], cache: C
 
     args = tome_info["args"]
 
-    if (args['deep_cache'] and (downsample <= args["max_downsample"] and (cache.index in (0, 13, 14)))) or \
-            (not args['deep_cache'] and downsample <= args["max_downsample"]):
-        if cache.cache_bus.ind_step == cache.step:
+    if downsample <= args["max_downsample"]:
+        if cache.cache_bus.ind_step == cache.cache_bus.step:
             m, u = cache.cache_bus.m_a, cache.cache_bus.u_a
 
-        else:
+        else: # when reaching a new step
             # Update indicator
-            cache.cache_bus.ind_step = cache.step
+            cache.cache_bus.ind_step = cache.cache_bus.step
+            cache.cache_bus.downsample = downsample
 
             w = int(math.ceil(original_w / downsample))
             h = int(math.ceil(original_h / downsample))
@@ -174,16 +197,17 @@ def patch_solver(solver_class):
 
             # # logging 1
             # feature_map = np.array(m0[0].unsqueeze(dim=0).cpu(), dtype=np.float32).astype(np.float16)
-            # self._cache_bus.model_outputs[self._cache_bus.step] = feature_map
+            # self._cache_bus.model_outputs[self._cache_bus.c_step] = feature_map
 
             choice = "second_order"
 
             if choice == "third_order":
-                if self._cache_bus.step == 1: # the first time this code is reached
+                """An implementation closer to Adaptive Diffusion"""
+                if self._cache_bus.c_step == 1: # the first time this code is reached
                     self._cache_bus.prev_fm = m1.clone()
                     score = None
 
-                elif self._cache_bus.step == 2: # the second time this code is reached
+                elif self._cache_bus.c_step == 2: # the second time this code is reached
                     self._cache_bus.prev_prev_fm = self._cache_bus.prev_fm.clone()
                     self._cache_bus.prev_fm = m1.clone()
                     score = None
@@ -204,38 +228,72 @@ def patch_solver(solver_class):
                     self._cache_bus.prev_fm = m1.clone()
 
             elif choice == "second_order":
-                if self._cache_bus.step == 1:  # the first time this code is reached
+                if self._cache_bus.c_step == 1:  # the first time this code is reached
                     self._cache_bus.prev_fm = m1.clone()
                     score = None
 
                 else:
+                    # get hyperparameters
+                    threshold_token = self._cache_bus._tome_info['args']['threshold_token']
+                    threshold_map = self._cache_bus._tome_info['args']['threshold_map']
+                    max_fix = self._cache_bus._tome_info['args']['max_fix']
+
                     cur_diff = (m0 - m1).abs().mean(dim=1)
                     prev_diff = (m1 - self._cache_bus.prev_fm).abs().mean(dim=1)
 
-                    diff = abs(cur_diff - prev_diff)
-                    # score = (diff >= 0.15 * m1.abs().mean()).float() # here the metric is a single real number
+                    momentum = abs(cur_diff - prev_diff)
 
-                    # Calculate the dynamic threshold value
-                    threshold_value = 0.15 * m1.abs().mean()
-                    threshold_num = 1024*4
+                    # todo: only for testing, delete later
+                    # if self._cache_bus._tome_info['args']['test_skip_path'] and self._cache_bus.step in self._cache_bus._tome_info['args']['test_skip_path']:
+                    #     self._cache_bus.skip_this_step = True
 
-                    diff_flat = diff.view(-1)
-                    mask = diff_flat >= threshold_value
-                    num_exceeds = mask.sum().item()
-                    score_flat = torch.zeros_like(diff_flat)
+                    if self._cache_bus.prev_momentum is not None:
+                        # # we define the skipping-step metric as the sudden drop of acceleration
+                        # [5, 7, 9, 10, 11, 15, 16, 17, 18, 20, 22, 24, 28, 29], 0.0933
 
-                    if num_exceeds > threshold_num:
-                        # If more elements exceed the threshold than allowed, select the top 'threshold' elements
-                        topk_values, topk_indices = torch.topk(diff_flat, threshold_num, largest=True, sorted=False)
-                        score_flat[topk_indices] = 1.0
+                        # # we define the skipping-step metric as the sudden drop of acceleration
+                        d_momentum = (momentum.abs() - self._cache_bus.prev_momentum.abs()).mean()
+                        self._cache_bus.skip_this_step = (momentum.abs().mean() <= - threshold_map * m1.abs().mean())
+
+                        # todo: only for testing, delete later
+                        abs_momentum = float(d_momentum.item())
+                        rel_momentum = float((d_momentum.item() / m1.abs().mean()).item())
+                        print(f"Abs Momentum: {abs_momentum}")
+                        print(f"Rel Momentum: {rel_momentum}")
+                        self._cache_bus.abs_momentum_list.append(abs_momentum)
+                        self._cache_bus.rel_momentum_list.append(rel_momentum)
+
+                    if self._cache_bus.skip_this_step:
+                        # Bypass the score computation
+                        score = None
+                        self._cache_bus.b_idx = None
+
                     else:
-                        # If fewer elements exceed the threshold, set all of them to 1
-                        score_flat[mask] = 1.0
+                        # Calculate the dynamic threshold value
+                        threshold_value = threshold_token * m1.abs().mean()
 
-                    score = score_flat.view_as(diff)
+                        momentum_flat = momentum.view(-1)
+                        mask = momentum_flat >= threshold_value
+                        num_exceeds = mask.sum().item()
+                        score_flat = torch.zeros_like(momentum_flat)
 
-                    self._cache_bus.temporal_score = score
+                        print(f"num_exceed {num_exceeds}")
+
+                        if num_exceeds > max_fix:
+                            # If more elements exceed the threshold than allowed, select the top 'threshold' elements
+                            topk_values, topk_indices = torch.topk(momentum_flat, max_fix, largest=True, sorted=False)
+                            score_flat[topk_indices] = 1.0
+                        else:
+                            # If fewer elements exceed the threshold, set all of them to 1
+                            score_flat[mask] = 1.0
+
+                        score = score_flat.view_as(momentum)
+
+
+                    self._cache_bus.prev_momentum = momentum
                     self._cache_bus.prev_fm = m1.clone()
+                    self._cache_bus.temporal_score = score
+
             else:
                 raise NotImplementedError
 
@@ -244,9 +302,9 @@ def patch_solver(solver_class):
             #     score = score.expand([1, 4, 96, 96])
             #     m0 = m0 + score * 2.5
             # feature_map = np.array(m0[0].unsqueeze(dim=0).cpu(), dtype=np.float32).astype(np.float16)
-            # self._cache_bus.model_outputs_change[self._cache_bus.step] = feature_map
+            # self._cache_bus.model_outputs_change[self._cache_bus.c_step] = feature_map
 
-            self._cache_bus.step += 1
+            self._cache_bus.c_step += 1
             return x_t
 
     return PatchedDPMSolverMultistepScheduler
@@ -266,7 +324,6 @@ def make_tome_block(block_class: Type[torch.nn.Module], mode: str = 'token_merge
             x = self.attn2(self.norm2(x), context=context) + x
             x = self.ff(self.norm3(x)) + x
 
-            self._cache.step += 1
             return x
 
     return ToMeBlock
@@ -302,8 +359,6 @@ def make_diffusers_tome_block(block_class: Type[torch.nn.Module], mode: str = 't
             else:
                 norm_hidden_states = self.norm1(hidden_states)
 
-            # (2) ToMe m_a
-
             # 1. Self-Attention
             cross_attention_kwargs = cross_attention_kwargs if cross_attention_kwargs is not None else {}
             attn_output = self.attn1(
@@ -315,7 +370,6 @@ def make_diffusers_tome_block(block_class: Type[torch.nn.Module], mode: str = 't
             if self.use_ada_layer_norm_zero:
                 attn_output = gate_msa.unsqueeze(1) * attn_output
 
-            # (3) ToMe u_a
             hidden_states = attn_output + hidden_states
 
             if self.attn2 is not None:
@@ -347,11 +401,335 @@ def make_diffusers_tome_block(block_class: Type[torch.nn.Module], mode: str = 't
 
             hidden_states = u_a(hidden_states, cache=self._cache)
 
-            self._cache.step += 1
-
             return hidden_states
 
     return ToMeBlock
+
+
+
+def patch_unet(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
+    class PatchedUnet(block_class):
+        def forward(
+            self,
+            sample: torch.FloatTensor,
+            timestep: Union[torch.Tensor, float, int],
+            encoder_hidden_states: torch.Tensor,
+            class_labels: Optional[torch.Tensor] = None,
+            timestep_cond: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+            added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None,
+            down_block_additional_residuals: Optional[Tuple[torch.Tensor]] = None,
+            mid_block_additional_residual: Optional[torch.Tensor] = None,
+            down_intrablock_additional_residuals: Optional[Tuple[torch.Tensor]] = None,
+            encoder_attention_mask: Optional[torch.Tensor] = None,
+            return_dict: bool = True,
+        ) -> Union[UNet2DConditionOutput, Tuple]:
+
+            skip_this_step = self._cache_bus.skip_this_step
+            if skip_this_step and self._cache_bus.prev_sample is not None:
+                print("======================================")
+                print("DEBUG: Skip step")
+                print("======================================")
+                self._cache_bus.last_skip_step = self._cache_bus.step  # todo dis-alignment between bus and cache
+                self._cache_bus.skip_this_step = False
+
+                self._cache_bus.skipping_path.append(self._cache_bus.step)
+
+                self._cache_bus.step += 1
+                return UNet2DConditionOutput(sample=self._cache_bus.prev_sample)
+
+            else:
+                default_overall_up_factor = 2 ** self.num_upsamplers
+
+                # upsample size should be forwarded when sample is not a multiple of `default_overall_up_factor`
+                forward_upsample_size = False
+                upsample_size = None
+
+                for dim in sample.shape[-2:]:
+                    if dim % default_overall_up_factor != 0:
+                        # Forward upsample size to force interpolation output size.
+                        forward_upsample_size = True
+                        break
+
+
+                if attention_mask is not None:
+                    # assume that mask is expressed as:
+                    #   (1 = keep,      0 = discard)
+                    # convert mask into a bias that can be added to attention scores:
+                    #       (keep = +0,     discard = -10000.0)
+                    attention_mask = (1 - attention_mask.to(sample.dtype)) * -10000.0
+                    attention_mask = attention_mask.unsqueeze(1)
+
+                # convert encoder_attention_mask to a bias the same way we do for attention_mask
+                if encoder_attention_mask is not None:
+                    encoder_attention_mask = (1 - encoder_attention_mask.to(sample.dtype)) * -10000.0
+                    encoder_attention_mask = encoder_attention_mask.unsqueeze(1)
+
+                # 0. center input if necessary
+                if self.config.center_input_sample:
+                    sample = 2 * sample - 1.0
+
+                # 1. time
+                timesteps = timestep
+                if not torch.is_tensor(timesteps):
+                    # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
+                    # This would be a good case for the `match` statement (Python 3.10+)
+                    is_mps = sample.device.type == "mps"
+                    if isinstance(timestep, float):
+                        dtype = torch.float32 if is_mps else torch.float64
+                    else:
+                        dtype = torch.int32 if is_mps else torch.int64
+                    timesteps = torch.tensor([timesteps], dtype=dtype, device=sample.device)
+                elif len(timesteps.shape) == 0:
+                    timesteps = timesteps[None].to(sample.device)
+
+                # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+                timesteps = timesteps.expand(sample.shape[0])
+
+                t_emb = self.time_proj(timesteps)
+                t_emb = t_emb.to(dtype=sample.dtype)
+
+                emb = self.time_embedding(t_emb, timestep_cond)
+                aug_emb = None
+
+                if self.class_embedding is not None:
+                    if class_labels is None:
+                        raise ValueError("class_labels should be provided when num_class_embeds > 0")
+
+                    if self.config.class_embed_type == "timestep":
+                        class_labels = self.time_proj(class_labels)
+
+                        # `Timesteps` does not contain any weights and will always return f32 tensors
+                        # there might be better ways to encapsulate this.
+                        class_labels = class_labels.to(dtype=sample.dtype)
+
+                    class_emb = self.class_embedding(class_labels).to(dtype=sample.dtype)
+
+                    if self.config.class_embeddings_concat:
+                        emb = torch.cat([emb, class_emb], dim=-1)
+                    else:
+                        emb = emb + class_emb
+
+                if self.config.addition_embed_type == "text":
+                    aug_emb = self.add_embedding(encoder_hidden_states)
+                elif self.config.addition_embed_type == "text_image":
+                    # Kandinsky 2.1 - style
+                    if "image_embeds" not in added_cond_kwargs:
+                        raise ValueError(
+                            f"{self.__class__} has the config param `addition_embed_type` set to 'text_image' which requires the keyword argument `image_embeds` to be passed in `added_cond_kwargs`"
+                        )
+
+                    image_embs = added_cond_kwargs.get("image_embeds")
+                    text_embs = added_cond_kwargs.get("text_embeds", encoder_hidden_states)
+                    aug_emb = self.add_embedding(text_embs, image_embs)
+                elif self.config.addition_embed_type == "text_time":
+                    # SDXL - style
+                    if "text_embeds" not in added_cond_kwargs:
+                        raise ValueError(
+                            f"{self.__class__} has the config param `addition_embed_type` set to 'text_time' which requires the keyword argument `text_embeds` to be passed in `added_cond_kwargs`"
+                        )
+                    text_embeds = added_cond_kwargs.get("text_embeds")
+                    if "time_ids" not in added_cond_kwargs:
+                        raise ValueError(
+                            f"{self.__class__} has the config param `addition_embed_type` set to 'text_time' which requires the keyword argument `time_ids` to be passed in `added_cond_kwargs`"
+                        )
+                    time_ids = added_cond_kwargs.get("time_ids")
+                    time_embeds = self.add_time_proj(time_ids.flatten())
+                    time_embeds = time_embeds.reshape((text_embeds.shape[0], -1))
+                    add_embeds = torch.concat([text_embeds, time_embeds], dim=-1)
+                    add_embeds = add_embeds.to(emb.dtype)
+                    aug_emb = self.add_embedding(add_embeds)
+                elif self.config.addition_embed_type == "image":
+                    # Kandinsky 2.2 - style
+                    if "image_embeds" not in added_cond_kwargs:
+                        raise ValueError(
+                            f"{self.__class__} has the config param `addition_embed_type` set to 'image' which requires the keyword argument `image_embeds` to be passed in `added_cond_kwargs`"
+                        )
+                    image_embs = added_cond_kwargs.get("image_embeds")
+                    aug_emb = self.add_embedding(image_embs)
+                elif self.config.addition_embed_type == "image_hint":
+                    # Kandinsky 2.2 - style
+                    if "image_embeds" not in added_cond_kwargs or "hint" not in added_cond_kwargs:
+                        raise ValueError(
+                            f"{self.__class__} has the config param `addition_embed_type` set to 'image_hint' which requires the keyword arguments `image_embeds` and `hint` to be passed in `added_cond_kwargs`"
+                        )
+                    image_embs = added_cond_kwargs.get("image_embeds")
+                    hint = added_cond_kwargs.get("hint")
+                    aug_emb, hint = self.add_embedding(image_embs, hint)
+                    sample = torch.cat([sample, hint], dim=1)
+
+                emb = emb + aug_emb if aug_emb is not None else emb
+
+                if self.time_embed_act is not None:
+                    emb = self.time_embed_act(emb)
+
+                if self.encoder_hid_proj is not None and self.config.encoder_hid_dim_type == "text_proj":
+                    encoder_hidden_states = self.encoder_hid_proj(encoder_hidden_states)
+                elif self.encoder_hid_proj is not None and self.config.encoder_hid_dim_type == "text_image_proj":
+                    # Kadinsky 2.1 - style
+                    if "image_embeds" not in added_cond_kwargs:
+                        raise ValueError(
+                            f"{self.__class__} has the config param `encoder_hid_dim_type` set to 'text_image_proj' which requires the keyword argument `image_embeds` to be passed in  `added_conditions`"
+                        )
+
+                    image_embeds = added_cond_kwargs.get("image_embeds")
+                    encoder_hidden_states = self.encoder_hid_proj(encoder_hidden_states, image_embeds)
+                elif self.encoder_hid_proj is not None and self.config.encoder_hid_dim_type == "image_proj":
+                    # Kandinsky 2.2 - style
+                    if "image_embeds" not in added_cond_kwargs:
+                        raise ValueError(
+                            f"{self.__class__} has the config param `encoder_hid_dim_type` set to 'image_proj' which requires the keyword argument `image_embeds` to be passed in  `added_conditions`"
+                        )
+                    image_embeds = added_cond_kwargs.get("image_embeds")
+                    encoder_hidden_states = self.encoder_hid_proj(image_embeds)
+                elif self.encoder_hid_proj is not None and self.config.encoder_hid_dim_type == "ip_image_proj":
+                    if "image_embeds" not in added_cond_kwargs:
+                        raise ValueError(
+                            f"{self.__class__} has the config param `encoder_hid_dim_type` set to 'ip_image_proj' which requires the keyword argument `image_embeds` to be passed in  `added_conditions`"
+                        )
+                    image_embeds = added_cond_kwargs.get("image_embeds")
+                    image_embeds = self.encoder_hid_proj(image_embeds).to(encoder_hidden_states.dtype)
+                    encoder_hidden_states = torch.cat([encoder_hidden_states, image_embeds], dim=1)
+
+                # 2. pre-process
+                sample = self.conv_in(sample)
+
+                # 2.5 GLIGEN position net
+                if cross_attention_kwargs is not None and cross_attention_kwargs.get("gligen", None) is not None:
+                    cross_attention_kwargs = cross_attention_kwargs.copy()
+                    gligen_args = cross_attention_kwargs.pop("gligen")
+                    cross_attention_kwargs["gligen"] = {"objs": self.position_net(**gligen_args)}
+
+                # 3. down
+                lora_scale = cross_attention_kwargs.get("scale", 1.0) if cross_attention_kwargs is not None else 1.0
+                if USE_PEFT_BACKEND:
+                    # weight the lora layers by setting `lora_scale` for each PEFT layer
+                    scale_lora_layers(self, lora_scale)
+
+                is_controlnet = mid_block_additional_residual is not None and down_block_additional_residuals is not None
+                # using new arg down_intrablock_additional_residuals for T2I-Adapters, to distinguish from controlnets
+                is_adapter = down_intrablock_additional_residuals is not None
+                # maintain backward compatibility for legacy usage, where
+                #       T2I-Adapter and ControlNet both use down_block_additional_residuals arg
+                #       but can only use one or the other
+                if not is_adapter and mid_block_additional_residual is None and down_block_additional_residuals is not None:
+                    down_intrablock_additional_residuals = down_block_additional_residuals
+                    is_adapter = True
+
+                down_block_res_samples = (sample,)
+                for downsample_block in self.down_blocks:
+                    if hasattr(downsample_block, "has_cross_attention") and downsample_block.has_cross_attention:
+                        # For t2i-adapter CrossAttnDownBlock2D
+                        additional_residuals = {}
+                        if is_adapter and len(down_intrablock_additional_residuals) > 0:
+                            additional_residuals["additional_residuals"] = down_intrablock_additional_residuals.pop(0)
+
+                        sample, res_samples = downsample_block(
+                            hidden_states=sample,
+                            temb=emb,
+                            encoder_hidden_states=encoder_hidden_states,
+                            attention_mask=attention_mask,
+                            cross_attention_kwargs=cross_attention_kwargs,
+                            encoder_attention_mask=encoder_attention_mask,
+                            **additional_residuals,
+                        )
+                    else:
+                        sample, res_samples = downsample_block(hidden_states=sample, temb=emb, scale=lora_scale)
+                        if is_adapter and len(down_intrablock_additional_residuals) > 0:
+                            sample += down_intrablock_additional_residuals.pop(0)
+
+                    down_block_res_samples += res_samples
+
+                if is_controlnet:
+                    new_down_block_res_samples = ()
+
+                    for down_block_res_sample, down_block_additional_residual in zip(
+                            down_block_res_samples, down_block_additional_residuals
+                    ):
+                        down_block_res_sample = down_block_res_sample + down_block_additional_residual
+                        new_down_block_res_samples = new_down_block_res_samples + (down_block_res_sample,)
+
+                    down_block_res_samples = new_down_block_res_samples
+
+                # 4. mid
+                if self.mid_block is not None:
+                    if hasattr(self.mid_block, "has_cross_attention") and self.mid_block.has_cross_attention:
+                        sample = self.mid_block(
+                            sample,
+                            emb,
+                            encoder_hidden_states=encoder_hidden_states,
+                            attention_mask=attention_mask,
+                            cross_attention_kwargs=cross_attention_kwargs,
+                            encoder_attention_mask=encoder_attention_mask,
+                        )
+                    else:
+                        sample = self.mid_block(sample, emb)
+
+                    # To support T2I-Adapter-XL
+                    if (
+                            is_adapter
+                            and len(down_intrablock_additional_residuals) > 0
+                            and sample.shape == down_intrablock_additional_residuals[0].shape
+                    ):
+                        sample += down_intrablock_additional_residuals.pop(0)
+
+                if is_controlnet:
+                    sample = sample + mid_block_additional_residual
+
+                # 5. up
+                for i, upsample_block in enumerate(self.up_blocks):
+                    is_final_block = i == len(self.up_blocks) - 1
+
+                    res_samples = down_block_res_samples[-len(upsample_block.resnets):]
+                    down_block_res_samples = down_block_res_samples[: -len(upsample_block.resnets)]
+
+                    # if we have not reached the final block and need to forward the
+                    # upsample size, we do it here
+                    if not is_final_block and forward_upsample_size:
+                        upsample_size = down_block_res_samples[-1].shape[2:]
+
+                    if hasattr(upsample_block, "has_cross_attention") and upsample_block.has_cross_attention:
+                        sample = upsample_block(
+                            hidden_states=sample,
+                            temb=emb,
+                            res_hidden_states_tuple=res_samples,
+                            encoder_hidden_states=encoder_hidden_states,
+                            cross_attention_kwargs=cross_attention_kwargs,
+                            upsample_size=upsample_size,
+                            attention_mask=attention_mask,
+                            encoder_attention_mask=encoder_attention_mask,
+                        )
+                    else:
+                        sample = upsample_block(
+                            hidden_states=sample,
+                            temb=emb,
+                            res_hidden_states_tuple=res_samples,
+                            upsample_size=upsample_size,
+                            scale=lora_scale,
+                        )
+
+                # 6. post-process
+                if self.conv_norm_out:
+                    sample = self.conv_norm_out(sample)
+                    sample = self.conv_act(sample)
+                sample = self.conv_out(sample)
+
+                # clone the sample to cache for skipping step
+                self._cache_bus.prev_sample = sample
+                self._cache_bus.step += 1
+
+                if USE_PEFT_BACKEND:
+                    # remove `lora_scale` from each PEFT layer
+                    unscale_lora_layers(self, lora_scale)
+
+                if not return_dict:
+                    return (sample,)
+
+                return UNet2DConditionOutput(sample=sample)
+
+    return PatchedUnet
+
 
 
 
@@ -397,10 +775,24 @@ def reset_cache(model: torch.nn.Module):
         diffusion_model = model.unet if hasattr(model, "unet") else model
 
     # reset bus
-    bus = diffusion_model._bus
+    bus = diffusion_model._cache_bus
+
+    bus.prev_fm = None
     bus.prev_prev_fm = None
     bus.temporal_score = None
-    bus.step = 1
+
+    bus.prev_momentum = None
+    bus.last_skip_step = 0  # align with step in cache bus
+    bus.skip_this_step = False
+    bus.prev_sample = None
+    bus.b_idx = None
+
+    bus.abs_momentum_list = []
+    bus.rel_momentum_list = []
+    bus.skipping_path = []
+
+    bus.step = 0
+    bus.c_step = 1
 
     index = 0
     for _, module in diffusion_model.named_modules():
@@ -426,7 +818,11 @@ def apply_patch(
         cache_step: Tuple[int, int] = (1, 49),
         push_unmerged: bool = True,
 
-        deep_cache: bool = True
+        test_skip_path: List[int] =None,
+        max_fix: int = 5 * 1024,
+        threshold_token: float = 0.15,
+        threshold_map: float = 0.015,
+        cache_interval: int = 3,
 ):
     # == merging preparation ==
     global DEBUG_MODE
@@ -462,7 +858,11 @@ def apply_patch(
         f"merge_step: {merge_step}\n"
         f"cache_step: {cache_start, cache_step[-1]}\n"
         f"push_unmerged: {push_unmerged}\n"
-        f"deep_cahce: {deep_cache}"
+        
+        f"threshold_token: {threshold_token}\n"
+        f"threshold_map: {threshold_map}\n"
+        f"max_fix: {max_fix}"
+        f"cache_interval: {cache_interval}"
     )
 
     diffusion_model._tome_info = {
@@ -484,16 +884,23 @@ def apply_patch(
             "cache_end": cache_step[-1],
             "push_unmerged": push_unmerged,
 
-            "deep_cache": deep_cache
+            "test_skip_path": test_skip_path,
+
+            "threshold_token": threshold_token,
+            "threshold_map": threshold_map,
+            "max_fix": max_fix,
+            "cache_interval": cache_interval
         }
     }
 
     hook_tome_model(diffusion_model)
 
-    diffusion_model._bus = CacheBus()
+    diffusion_model.__class__ = patch_unet(diffusion_model.__class__)
+    diffusion_model._cache_bus = CacheBus()
+    diffusion_model._cache_bus._tome_info = diffusion_model._tome_info
 
     solver.__class__ = patch_solver(solver.__class__)
-    solver._cache_bus = diffusion_model._bus
+    solver._cache_bus = diffusion_model._cache_bus
 
     index = 0
     for _, module in diffusion_model.named_modules():
@@ -501,7 +908,7 @@ def apply_patch(
             make_tome_block_fn = make_diffusers_tome_block if is_diffusers else make_tome_block
             module.__class__ = make_tome_block_fn(module.__class__, mode=mode)
             module._tome_info = diffusion_model._tome_info
-            module._cache = Cache(cache_bus=diffusion_model._bus, index=index)
+            module._cache = Cache(cache_bus=diffusion_model._cache_bus, index=index)
             rand_indices = generate_semi_random_indices(module._tome_info["args"]['sy'],
                                                         module._tome_info["args"]['sx'],
                                                         latent_size[0], latent_size[1], steps=60)
@@ -542,98 +949,3 @@ def get_logged_feature_maps(model: torch.nn.Module, file_name: str = "outputs/mo
 
     numpy_feature_maps = {str(k): [fm.cpu().numpy() if isinstance(fm, torch.Tensor) else fm for fm in v] for k, v in model._bus.model_outputs_change.items()}
     np.savez("outputs/model_outputs_change.npz", **numpy_feature_maps)
-
-
-
-# class Cache:
-#     def __init__(self, index: int, cache_bus: CacheBus, broadcast_range: int = 1):
-#         self.cache_bus = cache_bus
-#
-#         self.feature_map = None
-#         self.hsy = None
-#         self.wsx = None
-#         self.sy_sx = None
-#
-#         self.index = index
-#         self.rand_indices = None
-#         self.step = 0
-#
-#     # == 1. Cache Merge Operations == #
-#     def push(self, x: torch.Tensor, index: torch.Tensor = None) -> None:
-#         """
-#         Pushes preserved patches to the cache.
-#
-#         Args:
-#             x (torch.Tensor): Tensor of preserved patches with shape [B, N_p, C],
-#                               where N_p = number of preserved patches * sy * sx.
-#             index (torch.Tensor): Tensor of patch indices with shape [num_preserved_patches, 3],
-#                                    where each row is [Batch_idx, hsy_idx, wsx_idx].
-#         """
-#         if self.feature_map is None:
-#             # Initialize the feature_map tensor to store preserved patches
-#             self.feature_map = x
-#
-#             if DEBUG_MODE:
-#                 print(f"\033[96mCache Push\033[0m: Initialized feature_map with shape {self.feature_map.shape}")
-#
-#             return
-#
-#         if self.hsy is None and index is not None:
-#             # Extract dimensions from index
-#             B = self.feature_map.shape[0]
-#             hsy = index[:, 1].max().item() + 1  # Number of patches along height
-#             wsx = index[:, 2].max().item() + 1  # Number of patches along width
-#             sy_sx = self.feature_map.shape[1] // (hsy * wsx)  # Tokens per patch (sy * sx)
-#
-#             self.hsy = hsy
-#             self.wsx = wsx
-#             self.sy_sx = sy_sx
-#
-#             self.feature_map = self.feature_map.reshape([B, hsy, wsx, sy_sx, -1])
-#
-#         # Extract batch and patch indices
-#         hsy_idx = index[:, 1]    # Shape: [num_preserved_patches]
-#         wsx_idx = index[:, 2]    # Shape: [num_preserved_patches]
-#         num_preserved_patches = hsy_idx.shape[0]
-#
-#         # Validate indices
-#         if (hsy_idx.max() >= self.hsy) or (wsx_idx.max() >= self.wsx):
-#             raise IndexError("Patch indices exceed initialized feature_map dimensions.")
-#
-#         # Assign preserved patches to the feature_map
-#         self.feature_map[:, hsy_idx, wsx_idx, :, :] = x.view(2, num_preserved_patches, self.sy_sx, -1)
-#
-#         if DEBUG_MODE:
-#             print(f"\033[96mCache Push\033[0m: Pushed patches to cache index: {self.index}")
-#
-#         return
-#
-#     def pop(self, index: torch.Tensor) -> torch.Tensor:
-#         """
-#         Retrieves pruned patches from the cache.
-#
-#         Args:
-#             index (torch.Tensor): Tensor of patch indices with shape [num_pruned_patches, 3],
-#                                    where each row is [Batch_idx, hsy_idx, wsx_idx].
-#
-#         Returns:
-#             torch.Tensor: Tensor of retrieved patches with shape [B, num_pruned_patches * sy * sx, C].
-#         """
-#         if self.feature_map is None:
-#             raise RuntimeError("Feature map is empty. Cannot pop from cache.")
-#
-#         # Extract batch and patch indices
-#         hsy_idx = index[:, 1]    # Shape: [num_pruned_patches]
-#         wsx_idx = index[:, 2]    # Shape: [num_pruned_patches]
-#
-#         # Validate indices
-#         if (hsy_idx.max() >= self.hsy) or (wsx_idx.max() >= self.wsx):
-#             raise IndexError("Patch indices exceed initialized feature_map dimensions.")
-#
-#         # Retrieve pruned patches from the feature_map
-#         pruned_patches = self.feature_map[:, hsy_idx, wsx_idx, :, :]  # Shape: [B, sy*sx, C]
-#
-#         if DEBUG_MODE:
-#             print(f"\033[96mCache Pop\033[0m: Popped patches from cache index: {self.index}")
-#
-#         return pruned_patches

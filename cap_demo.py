@@ -94,8 +94,8 @@ def load_lora_weights(pipeline, checkpoint_path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default='stabilityai/stable-diffusion-2-1')  # model_id_v2_1 = 'stabilityai/stable-diffusion-2-1' 'stablediffusionapi/rev-animated' 'Meina/MeinaMix'
-    parser.add_argument("--prompt", type=str, default="a photograph of a sunflower in the desert")
-    parser.add_argument("--seed", type=int, default=5)
+    parser.add_argument("--prompt", type=str, default="The shiny motorcycle has been put on display")
+    parser.add_argument("--seed", type=int, default=11456)
     parser.add_argument("--height", type=int, default=768)
     parser.add_argument("--width", type=int, default=768)
     args = parser.parse_args()
@@ -127,7 +127,7 @@ if __name__ == "__main__":
     torch.cuda.empty_cache()
 
     # Cache-Assisted Pruning
-    pipe = DeepCacheStableDiffusionPipeline.from_pretrained(args.model, torch_dtype=torch.float16).to("cuda:0")
+    pipe = StableDiffusionPipeline.from_pretrained(args.model, torch_dtype=torch.float16).to("cuda:0")
     pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
     # pipe = load_lora_weights(pipe, lora_path)
 
@@ -142,7 +142,12 @@ if __name__ == "__main__":
                         cache_step=(3, 50),
                         push_unmerged=True,
                         prune=True,
-                        deep_cache=False)
+
+                        threshold_map=0.02,
+                        threshold_token=0.15,
+                        max_fix=1024*5,
+                        cache_interval=3
+                        )
 
     logging.info("Warming up GPU...")
     for _ in range(2):
@@ -154,13 +159,12 @@ if __name__ == "__main__":
     set_random_seed(seed)
 
     start_time = time.time()
-    cap_output = pipe(prompt,
-
-                      # cache_interval=2, cache_layer_id=0, cache_block_id=0,
-                      # uniform=True, pow=1.4, center=15,
-
-                      output_type='pt', height=args.height, width=args.width, num_inference_steps=50).images
+    cap_output = pipe(prompt, output_type='pt', height=args.height, width=args.width, num_inference_steps=50).images
     use_time = time.time() - start_time
+
+    print(pipe.unet._cache_bus.rel_momentum_list)
+    print(pipe.unet._cache_bus.abs_momentum_list)
+    print(pipe.unet._cache_bus.skipping_path)
 
     logging.info("CAP: {:.2f} seconds".format(use_time))
 
