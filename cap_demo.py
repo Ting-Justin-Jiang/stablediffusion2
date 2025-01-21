@@ -95,7 +95,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default='stabilityai/stable-diffusion-2-1')  # model_id_v2_1 = 'stabilityai/stable-diffusion-2-1' 'stablediffusionapi/rev-animated' 'Meina/MeinaMix'
     parser.add_argument("--prompt", type=str, default="The shiny motorcycle has been put on display")
-    parser.add_argument("--seed", type=int, default=11456)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--height", type=int, default=768)
     parser.add_argument("--width", type=int, default=768)
     args = parser.parse_args()
@@ -143,7 +143,7 @@ if __name__ == "__main__":
                         push_unmerged=True,
                         prune=True,
 
-                        threshold_map=0.02,
+                        threshold_map=0.0004,
                         threshold_token=0.15,
                         max_fix=1024*5,
                         cache_interval=3

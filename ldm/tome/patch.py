@@ -16,6 +16,10 @@ from dataclasses import dataclass
 class UNet2DConditionOutput(BaseOutput):
     sample: torch.FloatTensor = None
 
+@dataclass
+class SchedulerOutput(BaseOutput):
+    prev_sample: torch.FloatTensor
+
 
 class CacheBus:
     """A Bus class for overall control."""
@@ -25,6 +29,7 @@ class CacheBus:
         # momentum awareness
         self.prev_fm = None
         self.prev_prev_fm = None
+        self.prev_sample_list = [None, None]
         self.temporal_score = None
         self.step = 0
 
@@ -143,6 +148,61 @@ def compute_prune(x: torch.Tensor, mode:str, tome_info: Dict[str, Any], cache: C
 
 def patch_solver(solver_class):
     class PatchedDPMSolverMultistepScheduler(solver_class):
+        def step(
+                self,
+                model_output: torch.FloatTensor,
+                timestep: int,
+                sample: torch.FloatTensor,
+                generator=None,
+                return_dict: bool = True,
+        ) -> Union[SchedulerOutput, Tuple]:
+            if self.num_inference_steps is None:
+                raise ValueError(
+                    "Number of inference steps is 'None', you need to run 'set_timesteps' after creating the scheduler"
+                )
+
+            if self.step_index is None:
+                self._init_step_index(timestep)
+
+            # Improve numerical stability for small number of steps
+            lower_order_final = (self.step_index == len(self.timesteps) - 1) and (
+                    self.config.euler_at_final or (self.config.lower_order_final and len(self.timesteps) < 15)
+            )
+            lower_order_second = (
+                    (self.step_index == len(self.timesteps) - 2) and self.config.lower_order_final and len(
+                self.timesteps) < 15
+            )
+
+            model_output = self.convert_model_output(model_output, sample=sample)
+
+            for i in range(self.config.solver_order - 1):
+                self._cache_bus.prev_sample_list[i] = self._cache_bus.prev_sample_list[i + 1]
+                self.model_outputs[i] = self.model_outputs[i + 1]
+
+            self.model_outputs[-1] = model_output
+            self._cache_bus.prev_sample_list[-1] = sample
+
+            noise = None
+
+            if self.config.solver_order == 1 or self.lower_order_nums < 1 or lower_order_final:
+                prev_sample = self.dpm_solver_first_order_update(model_output, sample=sample, noise=noise)
+            elif self.config.solver_order == 2 or self.lower_order_nums < 2 or lower_order_second:
+                prev_sample = self.multistep_dpm_solver_second_order_update(self.model_outputs, sample=sample,
+                                                                            noise=noise)
+            else:
+                prev_sample = self.multistep_dpm_solver_third_order_update(self.model_outputs, sample=sample)
+
+            if self.lower_order_nums < self.config.solver_order:
+                self.lower_order_nums += 1
+
+            self._step_index += 1
+
+            if not return_dict:
+                return (prev_sample,)
+
+            return SchedulerOutput(prev_sample=prev_sample)
+
+
         def multistep_dpm_solver_second_order_update(
             self,
             model_output_list: List[torch.FloatTensor],
@@ -238,37 +298,45 @@ def patch_solver(solver_class):
                     threshold_map = self._cache_bus._tome_info['args']['threshold_map']
                     max_fix = self._cache_bus._tome_info['args']['max_fix']
 
-                    cur_diff = (m0 - m1).abs().mean(dim=1)
-                    prev_diff = (m1 - self._cache_bus.prev_fm).abs().mean(dim=1)
-
-                    momentum = abs(cur_diff - prev_diff)
-
                     # todo: only for testing, delete later
-                    # if self._cache_bus._tome_info['args']['test_skip_path'] and self._cache_bus.step in self._cache_bus._tome_info['args']['test_skip_path']:
-                    #     self._cache_bus.skip_this_step = True
+                    if self._cache_bus._tome_info['args']['test_skip_path'] and self._cache_bus.step in self._cache_bus._tome_info['args']['test_skip_path']:
+                        self._cache_bus.skip_this_step = True
 
-                    if self._cache_bus.prev_momentum is not None:
+                    if self._cache_bus.prev_prev_fm is not None:
                         # # we define the skipping-step metric as the sudden drop of acceleration
-                        # [5, 7, 9, 10, 11, 15, 16, 17, 18, 20, 22, 24, 28, 29], 0.0933
+                        # d_momentum = (cur_diff - prev_diff).mean()
+                        # d_momentum = (m0 - 3 * m1 + 3 * self._cache_bus.prev_fm - self._cache_bus.prev_prev_fm).mean()
+                        # d_momentum = (m0 - 2 * m1 + self._cache_bus.prev_fm).mean()
 
-                        # # we define the skipping-step metric as the sudden drop of acceleration
-                        d_momentum = (momentum.abs() - self._cache_bus.prev_momentum.abs()).mean()
-                        self._cache_bus.skip_this_step = (momentum.abs().mean() <= - threshold_map * m1.abs().mean())
+                        m_pred = m0 + (m0 - m1) + 1/2 * (m0 - 2 * m1 + self._cache_bus.prev_fm)
+                        d_momentum = (m_pred - 3 * m0 + 3 * m1 - self._cache_bus.prev_fm).mean()
+
+                        # x_t_1, x_t_2 = self._cache_bus.prev_sample_list[-1], self._cache_bus.prev_sample_list[-2]
+                        # x_t_p1 = x_t + (x_t - x_t_1) + 0.5 * (x_t - 2 * x_t_1 + x_t_2)
+                        # d_momentum = (x_t_p1 - 3 * x_t + 3 * x_t_1 - x_t_2).mean()
+
+                        self._cache_bus.skip_this_step = d_momentum <= - threshold_map * (self.sigmas[self.step_index])
 
                         # todo: only for testing, delete later
                         abs_momentum = float(d_momentum.item())
-                        rel_momentum = float((d_momentum.item() / m1.abs().mean()).item())
+                        rel_momentum = float((d_momentum.item() / self.sigmas[self.step_index]).item())
                         print(f"Abs Momentum: {abs_momentum}")
                         print(f"Rel Momentum: {rel_momentum}")
                         self._cache_bus.abs_momentum_list.append(abs_momentum)
                         self._cache_bus.rel_momentum_list.append(rel_momentum)
 
                     if self._cache_bus.skip_this_step:
-                        # Bypass the score computation
+                        # == In this branch, we proceed feature map-level pruning ==
                         score = None
                         self._cache_bus.b_idx = None
 
                     else:
+                        # == In this branch, we proceed feature-level pruning ==
+                        # calculate the momentum based on x0 prediction
+                        cur_diff = (m0 - m1).abs().mean(dim=1)
+                        prev_diff = (m1 - self._cache_bus.prev_fm).abs().mean(dim=1)
+                        momentum = (cur_diff - prev_diff).abs()
+
                         # Calculate the dynamic threshold value
                         threshold_value = threshold_token * m1.abs().mean()
 
@@ -290,7 +358,7 @@ def patch_solver(solver_class):
                         score = score_flat.view_as(momentum)
 
 
-                    self._cache_bus.prev_momentum = momentum
+                    self._cache_bus.prev_prev_fm = self._cache_bus.prev_fm
                     self._cache_bus.prev_fm = m1.clone()
                     self._cache_bus.temporal_score = score
 
@@ -347,8 +415,8 @@ def make_diffusers_tome_block(block_class: Type[torch.nn.Module], mode: str = 't
                 class_labels=None,
         ) -> torch.Tensor:
             # (1) ToMe
-            m_a, u_a = compute_prune(hidden_states, self._mode, self._tome_info, self._cache)
-            hidden_states = m_a(hidden_states, prune=self._tome_info['args']['prune'], cache=self._cache)
+            # m_a, u_a = compute_prune(hidden_states, self._mode, self._tome_info, self._cache)
+            # hidden_states = m_a(hidden_states, prune=self._tome_info['args']['prune'], cache=self._cache)
 
             if self.use_ada_layer_norm:
                 norm_hidden_states = self.norm1(hidden_states, timestep)
@@ -399,7 +467,7 @@ def make_diffusers_tome_block(block_class: Type[torch.nn.Module], mode: str = 't
                 ff_output = gate_mlp.unsqueeze(1) * ff_output
             hidden_states = ff_output + hidden_states
 
-            hidden_states = u_a(hidden_states, cache=self._cache)
+            # hidden_states = u_a(hidden_states, cache=self._cache)
 
             return hidden_states
 
@@ -780,6 +848,7 @@ def reset_cache(model: torch.nn.Module):
     bus.prev_fm = None
     bus.prev_prev_fm = None
     bus.temporal_score = None
+    bus.prev_sample_list = [None, None]
 
     bus.prev_momentum = None
     bus.last_skip_step = 0  # align with step in cache bus
@@ -949,3 +1018,4 @@ def get_logged_feature_maps(model: torch.nn.Module, file_name: str = "outputs/mo
 
     numpy_feature_maps = {str(k): [fm.cpu().numpy() if isinstance(fm, torch.Tensor) else fm for fm in v] for k, v in model._bus.model_outputs_change.items()}
     np.savez("outputs/model_outputs_change.npz", **numpy_feature_maps)
+
