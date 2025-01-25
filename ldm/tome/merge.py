@@ -299,9 +299,6 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
         a_idx = a_idx_flat.view(1, -1, 1)  # Updated a_idx
         b_idx = b_idx_flat.view(1, -1, 1)  # Updated b_idx
 
-        # update the b_idx
-        cache.cache_bus.b_idx = b_idx
-
         # Update r and num_dst based on new shapes
         r = a_idx.size(1)
         num_dst = b_idx.size(1)
