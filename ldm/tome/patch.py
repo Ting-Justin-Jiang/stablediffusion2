@@ -29,15 +29,10 @@ class CacheBus:
         self.rand_indices = {}  # key: index, value: rand_idx
 
         # momentum awareness
-        self.prev_x0 = None
-        self.prev_prev_x0 = None
+        self.prev_x0 = [None, None]
         self.prev_sample_list = [None, None]
         self.temporal_score = None
         self.step = 0
-
-        # partial calculation of momentum
-        self.downsample = 1
-        self.b_idx = None
 
         # save functions calculated for given step
         self.m_a = None  # todo untested
@@ -48,11 +43,9 @@ class CacheBus:
         self.ind_step = None  # todo untested
 
         # model-level accel
-        self.prev_momentum = None
         self.last_skip_step = 0  # align with step in cache bus
         self.skip_this_step = False
         self.prev_noise = [None, None]
-        self.prev_f = [None, None, None]
 
         # remove comment to log
         # self.model_outputs = {}
@@ -113,7 +106,6 @@ def compute_prune(x: torch.Tensor, mode: str, tome_info: Dict[str, Any], cache: 
         else:  # when reaching a new step
             # Update indicator
             cache.cache_bus.ind_step = cache.cache_bus.step
-            cache.cache_bus.downsample = downsample
 
             w = int(math.ceil(original_w / downsample))
             h = int(math.ceil(original_h / downsample))
@@ -178,39 +170,111 @@ def patch_solver(solver_class):
                 self.timesteps) < 15
             )
 
+            # # == right after we convert to data prediction: ==
+            # == Conduct the step skipping identified from last step == #
+            if self._cache_bus.skip_this_step and self._cache_bus.pred_m_m_1 is not None:
+                model_output = self._cache_bus.pred_m_m_1
+                self._cache_bus.skip_this_step = False
+            else:
+                model_output = self.convert_model_output(model_output, sample=sample)
 
+            m0 = model_output
+
+            if self._cache_bus.prev_x0[0] is not None:
+                m1 = self._cache_bus.prev_x0[-1]
+                m2 = self._cache_bus.prev_x0[-2]
+
+                N = self.timesteps.shape[0]
+
+                sigma_t, sigma_s0, sigma_s1 = (
+                    self.sigmas[self.step_index + 1],
+                    self.sigmas[self.step_index],
+                    self.sigmas[self.step_index - 1],
+                )
+
+                alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma_t)
+                alpha_s0, sigma_s0 = self._sigma_to_alpha_sigma_t(sigma_s0)
+                alpha_s1, sigma_s1 = self._sigma_to_alpha_sigma_t(sigma_s1)
+
+                beta_n = self.betas[self.timesteps[self.step_index - 1]]
+                beta_n_1 = self.betas[self.timesteps[min(N - 1, self.step_index)]]
+                beta_n_m1 = self.betas[self.timesteps[self.step_index - 2]]
+
+                s_alpha_cumprod_n = self.alpha_t[self.timesteps[self.step_index - 1]]
+                s_alpha_cumprod_n_1 = self.alpha_t[self.timesteps[min(N - 1, self.step_index)]]
+                s_alpha_cumprod_n_m1 = self.alpha_t[self.timesteps[self.step_index - 2]]
+
+                delta = 1 / N  # step size correlates with number of inference step
+
+                # CFG to the noise
+                epsilon_0 = self._cache_bus.prev_noise[-1][0] + 5.0 * (
+                        self._cache_bus.prev_noise[-1][1] - self._cache_bus.prev_noise[-1][0])
+                epsilon_1 = self._cache_bus.prev_noise[-2][0] + 5.0 * (
+                        self._cache_bus.prev_noise[-2][1] - self._cache_bus.prev_noise[-2][0])
+
+                # AM method
+                term_1 = (1 + 0.25 * delta * N * beta_n) * s_alpha_cumprod_n * m0
+                term_2 = 0.25 * delta * N * beta_n_1 * s_alpha_cumprod_n_1 * m1
+                term_3 = ((1 + 0.25 * delta * N * beta_n) * sigma_s0 - sigma_s1 - (delta * N * beta_n) / (4 * sigma_s0)) * epsilon_0
+                term_4 = (0.25 * delta * N * beta_n_1 * sigma_t - (delta * N * beta_n_1) / (4 * sigma_t)) * epsilon_1
+
+                m_m_1 = (term_1 + term_2 + term_3 + term_4) / s_alpha_cumprod_n_m1
+
+                # calculate MSE for our prediction
+                if self._cache_bus.pred_m_m_1 is not None:
+                    error = ((self._cache_bus.pred_m_m_1 - m0) ** 2).mean()
+                    print(f"\n Our Approximation error - : {error}")
+                    self._cache_bus.pred_error_list.append(float(error.item()))
+                    print(self._cache_bus.pred_error_list)
+                self._cache_bus.pred_m_m_1 = m_m_1.clone()
+
+                # calculate MSE for taylor prediction
+                taylor_m_m_1 = m0 + (m0 - m1) + 0.5 * (m0 - 2 * m1 + m2)
+                if self._cache_bus.taylor_m_m_1 is not None:
+                    taylor_error = ((self._cache_bus.taylor_m_m_1 - m0) ** 2).mean()
+                    print(f"\n Taylor Approximation error - : {taylor_error}")
+                    self._cache_bus.taylor_error_list.append(float(taylor_error.item()))
+                    print(self._cache_bus.taylor_error_list)
+                self._cache_bus.taylor_m_m_1 = taylor_m_m_1.clone()
+
+
+                # == Calculate the step skipping for next step == #
+                # == Token-wise Calculation == #
+                # momentum = (m_m_1 - 3 * m0 + 3 * m1 - m2).view(-1)
+                # threshold_value = - 0.15 * (m_m_1 - m0).view(-1)
+                #
+                # mask = momentum >= threshold_value
+                # num_exceeds = mask.sum().item()
+                #
+                # self._cache_bus.rel_momentum_list.append(num_exceeds)
+                #
+                # if num_exceeds <= 32000:
+                #     self._cache_bus.skip_this_step = True
+
+
+                # == Feature-map-wise Calculation == #
+                # momentum = (taylor_m_m_1 - 3 * m0 + 3 * m1 - m2).mean()
+                # abs_momentum = float(momentum.item())
+                # rel_momentum = float((momentum.item() / sigma_s0).item())
+                # self._cache_bus.abs_momentum_list.append(abs_momentum)
+                # self._cache_bus.rel_momentum_list.append(rel_momentum)
+                #
+                # if momentum <= - 0.0002 * sigma_s0:
+                #     self._cache_bus.skip_this_step = True
+
+
+                # only for testing, delete later
+                if self._cache_bus._tome_info['args']['test_skip_path'] and self._cache_bus.step in self._cache_bus._tome_info['args']['test_skip_path']:
+                    self._cache_bus.skip_this_step = True
+
+
+            for i in range(1):
+                self._cache_bus.prev_x0[i] = self._cache_bus.prev_x0[i + 1]
+            self._cache_bus.prev_x0[-1] = m0
 
 
             # # === TODO: Experiment area, Do NOT write anything new pass this ===
-            # # == before we convert everything to data prediction: ==
-            # N = self.timesteps.shape[0]
-            # beta_n = self.betas[self.timesteps[self.step_index - 1]]
-            # sigma_t, sigma_s0, sigma_s1 = (
-            #     self.sigmas[self.step_index + 1],
-            #     self.sigmas[self.step_index],
-            #     self.sigmas[self.step_index - 1],
-            # )
-            # # CFG to the noise
-            # epsilon_0 = self._cache_bus.prev_noise[-1][0] + 5.0 * (
-            #         self._cache_bus.prev_noise[-1][1] - self._cache_bus.prev_noise[-1][0])
-            #
-            # f = (- 0.5 * beta_n * N * sample) + (0.5 * beta_n * N / sigma_s0) * epsilon_0
-            #
-            # if self._cache_bus.prev_f[0] is not None:
-            #     momentum = ((self._cache_bus.prev_f[-1] - self._cache_bus.prev_f[-2]) - (
-            #                 self._cache_bus.prev_f[-2] - self._cache_bus.prev_f[-3])).abs() / (f.abs() + 1e-5)
-            #     momentum = momentum.mean()
-            #
-            # for i in range(2):
-            #     self._cache_bus.prev_f[i] = self._cache_bus.prev_f[i + 1]
-            # self._cache_bus.prev_f[-1] = f
-            #
-            # # == now we have a numerical 3-order difference ==
-            # # === TODO: Experiment area, Do NOT write anything new pass this ===
 
-
-
-            model_output = self.convert_model_output(model_output, sample=sample)
 
             for i in range(self.config.solver_order - 1):
                 self._cache_bus.prev_sample_list[i] = self._cache_bus.prev_sample_list[i + 1]
@@ -295,140 +359,57 @@ def patch_solver(solver_class):
             # feature_map = np.array(m0[0].unsqueeze(dim=0).cpu(), dtype=np.float32).astype(np.float16)
             # self._cache_bus.model_outputs[self._cache_bus.c_step] = feature_map
 
-            choice = "second_order"
-
-            if choice == "second_order":
-                if self._cache_bus.c_step == 1:  # the first time this code is reached
-                    self._cache_bus.prev_x0 = m1.clone()
-                    score = None
-
-                else:
-                    # get hyperparameters
-                    threshold_token = self._cache_bus._tome_info['args']['threshold_token']
-                    threshold_map = self._cache_bus._tome_info['args']['threshold_map']
-                    max_fix = self._cache_bus._tome_info['args']['max_fix']
-
-                    # # todo: only for testing, delete later
-                    # if self._cache_bus._tome_info['args']['test_skip_path'] and self._cache_bus.step in self._cache_bus._tome_info['args']['test_skip_path']:
-                    #     self._cache_bus.skip_this_step = True
-
-                    if self._cache_bus.prev_prev_x0 is not None:
-
-                        if self.step_index == 0:
-                            raise RuntimeError("Should start calculating momentum with at lest two latents")
-
-                        N = self.timesteps.shape[0]
-
-                        beta_n = self.betas[self.timesteps[self.step_index - 1]]
-                        beta_n_1 = self.betas[self.timesteps[min(N - 1, self.step_index)]]
-                        beta_n_m1 = self.betas[self.timesteps[self.step_index - 2]]
-
-                        s_alpha_cumprod_n = self.alpha_t[self.timesteps[self.step_index - 1]]
-                        s_alpha_cumprod_n_1 = self.alpha_t[self.timesteps[min(N - 1, self.step_index)]]
-                        s_alpha_cumprod_n_m1 = self.alpha_t[self.timesteps[self.step_index - 2]]
-
-                        delta = 1 / N  # step size correlates with number of inference step
-
-                        # CFG to the noise
-                        epsilon_0 = self._cache_bus.prev_noise[-1][0] + 5.0 * (
-                                    self._cache_bus.prev_noise[-1][1] - self._cache_bus.prev_noise[-1][0])
-                        epsilon_1 = self._cache_bus.prev_noise[-2][0] + 5.0 * (
-                                    self._cache_bus.prev_noise[-2][1] - self._cache_bus.prev_noise[-2][0])
-
-                        # AM method
-                        term_1 = (1 + 0.25 * delta * N * beta_n) * s_alpha_cumprod_n * m0
-                        term_2 = 0.25 * delta * N * beta_n_1 * s_alpha_cumprod_n_1 * m1
-                        term_3 = ((1 + 0.25 * delta * N * beta_n) * sigma_s0 - sigma_s1 - (delta * N * beta_n) / (4 * sigma_s0)) * epsilon_0
-                        term_4 = (0.25 * delta * N * beta_n_1 * sigma_t - (delta * N * beta_n_1) / (4 * sigma_t)) * epsilon_1
-
-                        m_m_1 = (term_1 + term_2 + term_3 + term_4) / s_alpha_cumprod_n_m1
-
-                        # calculate MSE for our prediction
-                        if self._cache_bus.pred_m_m_1 is not None:
-                            error = ((self._cache_bus.pred_m_m_1 - m0) ** 2).mean()
-                            print(f"\n Our Approximation error - : {error}")
-                            self._cache_bus.pred_error_list.append(float(error.item()))
-                            print(self._cache_bus.pred_error_list)
-                        self._cache_bus.pred_m_m_1 = m_m_1.clone()
-
-                        # calculate MSE for taylor prediction
-                        taylor_m_m_1 = m0 + (m0 - m1) + 0.5 * (m0 - 2 * m1 + self._cache_bus.prev_x0)
-                        if self._cache_bus.taylor_m_m_1 is not None:
-                            taylor_error = ((self._cache_bus.taylor_m_m_1 - m0) ** 2).mean()
-                            print(f"\n Taylor Approximation error - : {taylor_error}")
-                            self._cache_bus.taylor_error_list.append(float(taylor_error.item()))
-                            print(self._cache_bus.taylor_error_list)
-                        self._cache_bus.taylor_m_m_1 = taylor_m_m_1.clone()
-
-
-
-                        # === TODO: Experiment area, Do NOT write anything new pass this ===
-
-                        # # Token-wise Calculation
-                        # momentum = (m_m_1 - 3 * m0 + 3 * m1 - self._cache_bus.prev_x0).view(-1)
-                        # threshold_value = threshold_token * (m_m_1 - m0).view(-1)
-                        #
-                        # mask = momentum >= threshold_value
-                        # num_exceeds = mask.sum().item()
-                        #
-                        # self._cache_bus.rel_momentum_list.append(num_exceeds)
-                        #
-                        # if num_exceeds <= 30000:
-                        #     self._cache_bus.skip_this_step = True
-
-
-                        # Feature-map-wise Calculation
-                        momentum = (m_m_1 - 3 * m0 + 3 * m1 - self._cache_bus.prev_x0).mean()
-                        abs_momentum = float(momentum.item())
-                        rel_momentum = float((momentum.item() / sigma_s0).item())
-                        self._cache_bus.abs_momentum_list.append(abs_momentum)
-                        self._cache_bus.rel_momentum_list.append(rel_momentum)
-
-                        # if momentum <= - 0.0002 *  sigma_s0:
-                        #     self._cache_bus.skip_this_step = True
-
-                        # === TODO: Experiment area, Do NOT write anything new pass this ===
-
-
-
-                    if self._cache_bus.skip_this_step:
-                        # == In this branch, we proceed feature map-level pruning ==
-                        score = None
-                        self._cache_bus.b_idx = None
-
-                    else:
-                        # == In this branch, we proceed feature-level pruning ==
-                        # calculate the momentum based on x0 prediction
-                        cur_diff = (m0 - m1).abs().mean(dim=1)
-                        prev_diff = (m1 - self._cache_bus.prev_x0).abs().mean(dim=1)
-                        momentum = (cur_diff - prev_diff).abs()
-
-                        # Calculate the dynamic threshold value
-                        threshold_value = threshold_token * m1.abs().mean()
-
-                        momentum_flat = momentum.view(-1)
-                        mask = momentum_flat >= threshold_value
-                        num_exceeds = mask.sum().item()
-                        score_flat = torch.zeros_like(momentum_flat)
-
-                        print(f"num_exceed {num_exceeds}")
-
-                        if num_exceeds > max_fix:
-                            # If more elements exceed the threshold than allowed, select the top 'threshold' elements
-                            topk_values, topk_indices = torch.topk(momentum_flat, max_fix, largest=True, sorted=False)
-                            score_flat[topk_indices] = 1.0
-                        else:
-                            # If fewer elements exceed the threshold, set all of them to 1
-                            score_flat[mask] = 1.0
-
-                        score = score_flat.view_as(momentum)
-
-                    self._cache_bus.prev_prev_x0 = self._cache_bus.prev_x0
-                    self._cache_bus.prev_x0 = m1.clone()
-                    self._cache_bus.temporal_score = score
-
-            else:
-                raise NotImplementedError
+            # choice = "second_order"
+            #
+            # if choice == "second_order":
+            #     if self._cache_bus.c_step == 1:  # the first time this code is reached
+            #         self._cache_bus.prev_x0 = m1.clone()
+            #         score = None
+            #
+            #     else:
+            #         # get hyperparameters
+            #         threshold_token = self._cache_bus._tome_info['args']['threshold_token']
+            #         threshold_map = self._cache_bus._tome_info['args']['threshold_map']
+            #         max_fix = self._cache_bus._tome_info['args']['max_fix']
+            #
+            #         # # todo: only for testing, delete later
+            #         # if self._cache_bus._tome_info['args']['test_skip_path'] and self._cache_bus.step in self._cache_bus._tome_info['args']['test_skip_path']:
+            #         #     self._cache_bus.skip_this_step = True
+            #
+            #         if self._cache_bus.skip_this_step:
+            #             # == In this branch, we proceed feature map-level pruning ==
+            #             score = None
+            #             self._cache_bus.b_idx = None
+            #
+            #         else:
+            #             # == In this branch, we proceed feature-level pruning ==
+            #             # calculate the momentum based on x0 prediction
+            #             cur_diff = (m0 - m1).abs().mean(dim=1)
+            #             prev_diff = (m1 - self._cache_bus.prev_x0).abs().mean(dim=1)
+            #             momentum = (cur_diff - prev_diff).abs()
+            #
+            #             # Calculate the dynamic threshold value
+            #             threshold_value = threshold_token * m1.abs().mean()
+            #
+            #             momentum_flat = momentum.view(-1)
+            #             mask = momentum_flat >= threshold_value
+            #             num_exceeds = mask.sum().item()
+            #             score_flat = torch.zeros_like(momentum_flat)
+            #
+            #             print(f"num_exceed {num_exceeds}")
+            #
+            #             if num_exceeds > max_fix:
+            #                 # If more elements exceed the threshold than allowed, select the top 'threshold' elements
+            #                 topk_values, topk_indices = torch.topk(momentum_flat, max_fix, largest=True, sorted=False)
+            #                 score_flat[topk_indices] = 1.0
+            #             else:
+            #                 # If fewer elements exceed the threshold, set all of them to 1
+            #                 score_flat[mask] = 1.0
+            #
+            #             score = score_flat.view_as(momentum)
+            #
+            # else:
+            #     raise NotImplementedError
 
             # # logging 2
             # if score is not None:
@@ -562,7 +543,6 @@ def patch_unet(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
                 print("\033[96mDEBUG\033[0m: Skip step")
                 print("======================================")
                 self._cache_bus.last_skip_step = self._cache_bus.step  # todo dis-alignment between bus and cache
-                self._cache_bus.skip_this_step = False
                 self._cache_bus.skipping_path.append(self._cache_bus.step)
 
                 sample = self._cache_bus.prev_noise[-1].clone()
@@ -571,7 +551,7 @@ def patch_unet(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
                 self._cache_bus.prev_noise[-1] = sample
                 self._cache_bus.step += 1
 
-                return UNet2DConditionOutput(sample=sample)
+                return UNet2DConditionOutput(sample=torch.zeros_like(sample))
 
             else:
                 default_overall_up_factor = 2 ** self.num_upsamplers
@@ -908,8 +888,7 @@ def reset_cache(model: torch.nn.Module):
     # reset bus
     bus = diffusion_model._cache_bus
 
-    bus.prev_x0 = None
-    bus.prev_prev_x0 = None
+    bus.prev_x0 = [None, None]
     bus.temporal_score = None
     bus.prev_sample_list = [None, None]
 
@@ -917,7 +896,6 @@ def reset_cache(model: torch.nn.Module):
     bus.last_skip_step = 0  # align with step in cache bus
     bus.skip_this_step = False
     bus.prev_sample = None
-    bus.b_idx = None
 
     bus.abs_momentum_list = []
     bus.rel_momentum_list = []
