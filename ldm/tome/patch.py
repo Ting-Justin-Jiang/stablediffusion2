@@ -43,6 +43,7 @@ class CacheBus:
         self.ind_step = None  # todo untested
 
         # model-level accel
+        self.prev_f = [None, None, None]
         self.last_skip_step = 0  # align with step in cache bus
         self.skip_this_step = False
         self.prev_noise = [None, None]
@@ -180,37 +181,36 @@ def patch_solver(solver_class):
 
             m0 = model_output
 
+            N = self.timesteps.shape[0]
+
+            sigma_t, sigma_s0, sigma_s1 = (
+                self.sigmas[self.step_index + 1],
+                self.sigmas[self.step_index],
+                self.sigmas[self.step_index - 1],
+            )
+
+            alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma_t)
+            alpha_s0, sigma_s0 = self._sigma_to_alpha_sigma_t(sigma_s0)
+            alpha_s1, sigma_s1 = self._sigma_to_alpha_sigma_t(sigma_s1)
+
+            beta_n = self.betas[self.timesteps[self.step_index - 1]]
+            beta_n_1 = self.betas[self.timesteps[min(N - 1, self.step_index)]]
+            beta_n_m1 = self.betas[self.timesteps[self.step_index - 2]]
+
+            s_alpha_cumprod_n = self.alpha_t[self.timesteps[self.step_index - 1]]
+            s_alpha_cumprod_n_1 = self.alpha_t[self.timesteps[min(N - 1, self.step_index)]]
+            s_alpha_cumprod_n_m1 = self.alpha_t[self.timesteps[self.step_index - 2]]
+
+            delta = 1 / N  # step size correlates with number of inference step
+
+            epsilon_0 = self._cache_bus.prev_noise[-1][0] + 5.0 * (self._cache_bus.prev_noise[-1][1] - self._cache_bus.prev_noise[-1][0])
+
             if self._cache_bus.prev_x0[0] is not None:
                 m1 = self._cache_bus.prev_x0[-1]
                 m2 = self._cache_bus.prev_x0[-2]
 
-                N = self.timesteps.shape[0]
-
-                sigma_t, sigma_s0, sigma_s1 = (
-                    self.sigmas[self.step_index + 1],
-                    self.sigmas[self.step_index],
-                    self.sigmas[self.step_index - 1],
-                )
-
-                alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma_t)
-                alpha_s0, sigma_s0 = self._sigma_to_alpha_sigma_t(sigma_s0)
-                alpha_s1, sigma_s1 = self._sigma_to_alpha_sigma_t(sigma_s1)
-
-                beta_n = self.betas[self.timesteps[self.step_index - 1]]
-                beta_n_1 = self.betas[self.timesteps[min(N - 1, self.step_index)]]
-                beta_n_m1 = self.betas[self.timesteps[self.step_index - 2]]
-
-                s_alpha_cumprod_n = self.alpha_t[self.timesteps[self.step_index - 1]]
-                s_alpha_cumprod_n_1 = self.alpha_t[self.timesteps[min(N - 1, self.step_index)]]
-                s_alpha_cumprod_n_m1 = self.alpha_t[self.timesteps[self.step_index - 2]]
-
-                delta = 1 / N  # step size correlates with number of inference step
-
                 # CFG to the noise
-                epsilon_0 = self._cache_bus.prev_noise[-1][0] + 5.0 * (
-                        self._cache_bus.prev_noise[-1][1] - self._cache_bus.prev_noise[-1][0])
-                epsilon_1 = self._cache_bus.prev_noise[-2][0] + 5.0 * (
-                        self._cache_bus.prev_noise[-2][1] - self._cache_bus.prev_noise[-2][0])
+                epsilon_1 = self._cache_bus.prev_noise[-2][0] + 5.0 * (self._cache_bus.prev_noise[-2][1] - self._cache_bus.prev_noise[-2][0])
 
                 # AM method
                 term_1 = (1 + 0.25 * delta * N * beta_n) * s_alpha_cumprod_n * m0
@@ -263,9 +263,25 @@ def patch_solver(solver_class):
                 #     self._cache_bus.skip_this_step = True
 
 
-                # only for testing, delete later
+                # # only for testing, delete later
                 if self._cache_bus._tome_info['args']['test_skip_path'] and self._cache_bus.step in self._cache_bus._tome_info['args']['test_skip_path']:
                     self._cache_bus.skip_this_step = True
+
+
+            f = (- 0.5 * beta_n * N * sample) + (0.5 * beta_n * N / sigma_s0) * epsilon_0
+            if self._cache_bus.prev_f[0] is not None:
+                momentum = ((self._cache_bus.prev_f[-1] - self._cache_bus.prev_f[-2]) - (
+                            self._cache_bus.prev_f[-2] - self._cache_bus.prev_f[-3])) / (f + 1e-5)
+                momentum = momentum.mean()
+                self._cache_bus.rel_momentum_list.append((momentum.item()))
+
+                if momentum < - 0.08 and self._cache_bus.step <= 20:
+                    self._cache_bus.skip_this_step = True
+
+            for i in range(2):
+                self._cache_bus.prev_f[i] = self._cache_bus.prev_f[i + 1]
+            self._cache_bus.prev_f[-1] = f
+
 
 
             for i in range(1):
