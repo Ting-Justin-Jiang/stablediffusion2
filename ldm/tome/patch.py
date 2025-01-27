@@ -264,37 +264,33 @@ def patch_solver(solver_class):
 
 
                 # # only for testing, delete later
-                if self._cache_bus._tome_info['args']['test_skip_path'] and self._cache_bus.step in self._cache_bus._tome_info['args']['test_skip_path']:
-                    self._cache_bus.skip_this_step = True
+                # if self._cache_bus._tome_info['args']['test_skip_path'] and self._cache_bus.step in self._cache_bus._tome_info['args']['test_skip_path']:
+                #     self._cache_bus.skip_this_step = True
 
 
             f = (- 0.5 * beta_n * N * sample) + (0.5 * beta_n * N / sigma_s0) * epsilon_0
             if self._cache_bus.prev_f[0] is not None:
-                momentum = ((self._cache_bus.prev_f[-1] - self._cache_bus.prev_f[-2]) - (
-                            self._cache_bus.prev_f[-2] - self._cache_bus.prev_f[-3])) / (f + 1e-5)
+                momentum = (self._cache_bus.prev_f[-1] - self._cache_bus.prev_f[-2]) - (self._cache_bus.prev_f[-2] - self._cache_bus.prev_f[-3])
                 momentum = momentum.mean()
                 self._cache_bus.rel_momentum_list.append((momentum.item()))
 
-                if momentum < - 0.08 and self._cache_bus.step <= 20:
+                if momentum <= 0 and 6 < self._cache_bus.step < 45:
                     self._cache_bus.skip_this_step = True
 
             for i in range(2):
                 self._cache_bus.prev_f[i] = self._cache_bus.prev_f[i + 1]
             self._cache_bus.prev_f[-1] = f
 
-
-
-            for i in range(1):
-                self._cache_bus.prev_x0[i] = self._cache_bus.prev_x0[i + 1]
+            for j in range(1):
+                self._cache_bus.prev_x0[j] = self._cache_bus.prev_x0[j + 1]
             self._cache_bus.prev_x0[-1] = m0
 
 
             # # === TODO: Experiment area, Do NOT write anything new pass this ===
 
-
-            for i in range(self.config.solver_order - 1):
-                self._cache_bus.prev_sample_list[i] = self._cache_bus.prev_sample_list[i + 1]
-                self.model_outputs[i] = self.model_outputs[i + 1]
+            for k in range(self.config.solver_order - 1):
+                self._cache_bus.prev_sample_list[k] = self._cache_bus.prev_sample_list[k + 1]
+                self.model_outputs[k] = self.model_outputs[k + 1]
 
             self.model_outputs[-1] = model_output
             self._cache_bus.prev_sample_list[-1] = sample
