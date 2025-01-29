@@ -94,7 +94,7 @@ def load_lora_weights(pipeline, checkpoint_path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default='stabilityai/stable-diffusion-2-1')  # model_id_v2_1 = 'stabilityai/stable-diffusion-2-1' 'stablediffusionapi/rev-animated' 'Meina/MeinaMix'
-    parser.add_argument("--prompt", type=str, default="a purple Ducati motorcycle parked in the night market street of Hong Kong city")
+    parser.add_argument("--prompt", type=str, default="a Nissan Skyline parked in the night market street of Hong Kong Kowloon city")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--height", type=int, default=768)
     parser.add_argument("--width", type=int, default=768)
@@ -134,8 +134,8 @@ if __name__ == "__main__":
     patch.apply_patch(pipe,
                         ratio=0.99,
                         mode="cache_merge",
-                        sx=3, sy=3,
-                        max_downsample=0,
+                        sx=2, sy=2,
+                        max_downsample=1,
                         latent_size=(2 * math.ceil(args.height / 16),
                                      2 * math.ceil(args.width / 16)),
                         merge_step=(3, 50),

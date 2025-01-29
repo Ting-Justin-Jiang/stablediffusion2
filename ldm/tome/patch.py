@@ -28,9 +28,17 @@ class CacheBus:
     def __init__(self):
         self.rand_indices = {}  # key: index, value: rand_idx
 
-        # momentum awareness
+        # == Variable Caching ==
         self.prev_x0 = [None, None]
-        self.prev_sample_list = [None, None]
+        self.prev_xt = None
+        self.prev_epsilon = [None, None]
+        self.prev_f = [None, None, None]
+
+        # == Variable Prediction ==
+        self.pred_m_m_1 = None
+        self.taylor_m_m_1 = None
+        self.pred_epsilon = None
+
         self.temporal_score = None
         self.step = 0
 
@@ -41,18 +49,15 @@ class CacheBus:
         # indicator for re-calculation
         self.c_step = 1  # todo untested, just because dpm++ 2M starts from 2
         self.ind_step = None  # todo untested
+        self.cons_skip = 0
 
         # model-level accel
-        self.prev_f = [None, None, None]
         self.last_skip_step = 0  # align with step in cache bus
         self.skip_this_step = False
-        self.prev_noise = [None, None]
 
         # remove comment to log
         # self.model_outputs = {}
         # self.model_outputs_change = {}
-        self.pred_m_m_1 = None
-        self.taylor_m_m_1 = None
         self.pred_error_list = []
         self.taylor_error_list = []
 
@@ -171,7 +176,6 @@ def patch_solver(solver_class):
                 self.timesteps) < 15
             )
 
-            # # == right after we convert to data prediction: ==
             # == Conduct the step skipping identified from last step == #
             if self._cache_bus.skip_this_step and self._cache_bus.pred_m_m_1 is not None:
                 model_output = self._cache_bus.pred_m_m_1
@@ -203,16 +207,16 @@ def patch_solver(solver_class):
 
             delta = 1 / N  # step size correlates with number of inference step
 
-            epsilon_0 = self._cache_bus.prev_noise[-1][0] + 5.0 * (self._cache_bus.prev_noise[-1][1] - self._cache_bus.prev_noise[-1][0])
+            epsilon_0 = self._cache_bus.prev_epsilon[-1][0] + 5.0 * (self._cache_bus.prev_epsilon[-1][1] - self._cache_bus.prev_epsilon[-1][0])
 
             if self._cache_bus.prev_x0[0] is not None:
                 m1 = self._cache_bus.prev_x0[-1]
                 m2 = self._cache_bus.prev_x0[-2]
 
                 # CFG to the noise
-                epsilon_1 = self._cache_bus.prev_noise[-2][0] + 5.0 * (self._cache_bus.prev_noise[-2][1] - self._cache_bus.prev_noise[-2][0])
+                epsilon_1 = self._cache_bus.prev_epsilon[-2][0] + 5.0 * (self._cache_bus.prev_epsilon[-2][1] - self._cache_bus.prev_epsilon[-2][0])
 
-                # AM method
+                # == Calculate the future data prediction in a Adam Moulton fashion ==
                 term_1 = (1 + 0.25 * delta * N * beta_n) * s_alpha_cumprod_n * m0
                 term_2 = 0.25 * delta * N * beta_n_1 * s_alpha_cumprod_n_1 * m1
                 term_3 = ((1 + 0.25 * delta * N * beta_n) * sigma_s0 - sigma_s1 - (delta * N * beta_n) / (4 * sigma_s0)) * epsilon_0
@@ -237,45 +241,62 @@ def patch_solver(solver_class):
                     print(self._cache_bus.taylor_error_list)
                 self._cache_bus.taylor_m_m_1 = taylor_m_m_1.clone()
 
-
-                # == Calculate the step skipping for next step == #
-                # == Token-wise Calculation == #
-                # momentum = (m_m_1 - 3 * m0 + 3 * m1 - m2).view(-1)
-                # threshold_value = - 0.15 * (m_m_1 - m0).view(-1)
-                #
-                # mask = momentum >= threshold_value
-                # num_exceeds = mask.sum().item()
-                #
-                # self._cache_bus.rel_momentum_list.append(num_exceeds)
-                #
-                # if num_exceeds <= 32000:
-                #     self._cache_bus.skip_this_step = True
-
-
-                # == Feature-map-wise Calculation == #
-                # momentum = (taylor_m_m_1 - 3 * m0 + 3 * m1 - m2).mean()
-                # abs_momentum = float(momentum.item())
-                # rel_momentum = float((momentum.item() / sigma_s0).item())
-                # self._cache_bus.abs_momentum_list.append(abs_momentum)
-                # self._cache_bus.rel_momentum_list.append(rel_momentum)
-                #
-                # if momentum <= - 0.0002 * sigma_s0:
-                #     self._cache_bus.skip_this_step = True
-
-
-                # # only for testing, delete later
-                # if self._cache_bus._tome_info['args']['test_skip_path'] and self._cache_bus.step in self._cache_bus._tome_info['args']['test_skip_path']:
-                #     self._cache_bus.skip_this_step = True
-
+                # # only for testing
+                if self._cache_bus._tome_info['args']['test_skip_path'] and self._cache_bus.step in self._cache_bus._tome_info['args']['test_skip_path']:
+                    self._cache_bus.skip_this_step = True
 
             f = (- 0.5 * beta_n * N * sample) + (0.5 * beta_n * N / sigma_s0) * epsilon_0
+
             if self._cache_bus.prev_f[0] is not None:
                 momentum = (self._cache_bus.prev_f[-1] - self._cache_bus.prev_f[-2]) - (self._cache_bus.prev_f[-2] - self._cache_bus.prev_f[-3])
-                momentum = momentum.mean()
-                self._cache_bus.rel_momentum_list.append((momentum.item()))
+                momentum_mean = momentum.mean()
+                self._cache_bus.rel_momentum_list.append((momentum_mean.item()))
 
-                if momentum <= 0 and 6 < self._cache_bus.step < 45:
+                if self._cache_bus.cons_skip >= 3:
+                    self._cache_bus.skip_this_step = False
+                    self._cache_bus.cons_skip = 0
+
+                elif momentum_mean <= 0 and self._cache_bus.step in range(7, 45):
                     self._cache_bus.skip_this_step = True
+                    # Should actually calculate m_m_1 here
+                    self._cache_bus.cons_skip += 1
+
+                else:
+                    self._cache_bus.skip_this_step = False
+                    self._cache_bus.cons_skip = 0
+
+                # Here we conduct token-wise pruning:
+                if not self._cache_bus.skip_this_step:
+                    # # == Calculate the predicted epsilon == #
+                    # # Notation: f(t) = -0.5beta(t) g^2(t) = beta(t) beta(t) = N beta_t
+                    # assert m_m_1 is not None
+                    # assert epsilon_1 is not None
+                    #
+                    # factor = (1 / (0.25 * delta * N * beta_n / sigma_s0 + sigma_t))
+                    # term_1 = - s_alpha_cumprod_n_m1 * m_m_1
+                    # term_2 = (1 - 0.5 * delta * (- 0.5 * N * beta_n)) * sample
+                    # term_3 = 0.5 * (- 0.5 * delta * N * beta_n_1) * self._cache_bus.prev_xt
+                    # term_4 = - (0.25 * delta * N * beta_n_1 / sigma_s1) * epsilon_1
+                    #
+                    # pred_epsilon = factor * (term_1 + term_2 + term_3 + term_4)
+                    # self._cache_bus.pred_epsilon = pred_epsilon
+
+                    # == Define the masking on pruning
+                    max_fix = int(momentum.shape[-1] * momentum.shape[-2] * 0.6)
+
+                    momentum_mean = momentum.mean(dim=1)
+                    momentum_flat = momentum_mean.view(-1)
+                    mask = momentum_flat >= 0
+                    num_mask = mask.sum().item()
+                    score = torch.zeros_like(momentum_flat)
+
+                    if num_mask > max_fix:
+                        _, topk_indices = torch.topk(momentum_flat, max_fix, largest=True, sorted=False)
+                        score[topk_indices] = 1.0
+                    else:
+                        score[mask] = 1.0
+
+                    self._cache_bus.temporal_score = score.view_as(momentum_mean)
 
             for i in range(2):
                 self._cache_bus.prev_f[i] = self._cache_bus.prev_f[i + 1]
@@ -284,16 +305,12 @@ def patch_solver(solver_class):
             for j in range(1):
                 self._cache_bus.prev_x0[j] = self._cache_bus.prev_x0[j + 1]
             self._cache_bus.prev_x0[-1] = m0
-
-
-            # # === TODO: Experiment area, Do NOT write anything new pass this ===
+            self._cache_bus.prev_xt = sample
 
             for k in range(self.config.solver_order - 1):
-                self._cache_bus.prev_sample_list[k] = self._cache_bus.prev_sample_list[k + 1]
                 self.model_outputs[k] = self.model_outputs[k + 1]
 
             self.model_outputs[-1] = model_output
-            self._cache_bus.prev_sample_list[-1] = sample
 
             noise = None
 
@@ -371,58 +388,6 @@ def patch_solver(solver_class):
             # feature_map = np.array(m0[0].unsqueeze(dim=0).cpu(), dtype=np.float32).astype(np.float16)
             # self._cache_bus.model_outputs[self._cache_bus.c_step] = feature_map
 
-            # choice = "second_order"
-            #
-            # if choice == "second_order":
-            #     if self._cache_bus.c_step == 1:  # the first time this code is reached
-            #         self._cache_bus.prev_x0 = m1.clone()
-            #         score = None
-            #
-            #     else:
-            #         # get hyperparameters
-            #         threshold_token = self._cache_bus._tome_info['args']['threshold_token']
-            #         threshold_map = self._cache_bus._tome_info['args']['threshold_map']
-            #         max_fix = self._cache_bus._tome_info['args']['max_fix']
-            #
-            #         # # todo: only for testing, delete later
-            #         # if self._cache_bus._tome_info['args']['test_skip_path'] and self._cache_bus.step in self._cache_bus._tome_info['args']['test_skip_path']:
-            #         #     self._cache_bus.skip_this_step = True
-            #
-            #         if self._cache_bus.skip_this_step:
-            #             # == In this branch, we proceed feature map-level pruning ==
-            #             score = None
-            #             self._cache_bus.b_idx = None
-            #
-            #         else:
-            #             # == In this branch, we proceed feature-level pruning ==
-            #             # calculate the momentum based on x0 prediction
-            #             cur_diff = (m0 - m1).abs().mean(dim=1)
-            #             prev_diff = (m1 - self._cache_bus.prev_x0).abs().mean(dim=1)
-            #             momentum = (cur_diff - prev_diff).abs()
-            #
-            #             # Calculate the dynamic threshold value
-            #             threshold_value = threshold_token * m1.abs().mean()
-            #
-            #             momentum_flat = momentum.view(-1)
-            #             mask = momentum_flat >= threshold_value
-            #             num_exceeds = mask.sum().item()
-            #             score_flat = torch.zeros_like(momentum_flat)
-            #
-            #             print(f"num_exceed {num_exceeds}")
-            #
-            #             if num_exceeds > max_fix:
-            #                 # If more elements exceed the threshold than allowed, select the top 'threshold' elements
-            #                 topk_values, topk_indices = torch.topk(momentum_flat, max_fix, largest=True, sorted=False)
-            #                 score_flat[topk_indices] = 1.0
-            #             else:
-            #                 # If fewer elements exceed the threshold, set all of them to 1
-            #                 score_flat[mask] = 1.0
-            #
-            #             score = score_flat.view_as(momentum)
-            #
-            # else:
-            #     raise NotImplementedError
-
             # # logging 2
             # if score is not None:
             #     score = score.expand([1, 4, 96, 96])
@@ -430,7 +395,8 @@ def patch_solver(solver_class):
             # feature_map = np.array(m0[0].unsqueeze(dim=0).cpu(), dtype=np.float32).astype(np.float16)
             # self._cache_bus.model_outputs_change[self._cache_bus.c_step] = feature_map
 
-            self._cache_bus.c_step += 1
+            # self._cache_bus.c_step += 1
+
             return x_t
 
     return PatchedDPMSolverMultistepScheduler
@@ -471,7 +437,6 @@ def make_diffusers_tome_block(block_class: Type[torch.nn.Module], mode: str = 't
                 cross_attention_kwargs=None,
                 class_labels=None,
         ) -> torch.Tensor:
-            # (1) ToMe
             m_a, u_a = compute_prune(hidden_states, self._mode, self._tome_info, self._cache)
             hidden_states = m_a(hidden_states, prune=self._tome_info['args']['prune'], cache=self._cache)
 
@@ -550,17 +515,17 @@ def patch_unet(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
         ) -> Union[UNet2DConditionOutput, Tuple]:
 
             skip_this_step = self._cache_bus.skip_this_step
-            if skip_this_step and self._cache_bus.prev_noise[-1] is not None:
+            if skip_this_step and self._cache_bus.prev_epsilon[-1] is not None:
                 print("======================================")
                 print("\033[96mDEBUG\033[0m: Skip step")
                 print("======================================")
                 self._cache_bus.last_skip_step = self._cache_bus.step  # todo dis-alignment between bus and cache
                 self._cache_bus.skipping_path.append(self._cache_bus.step)
 
-                sample = self._cache_bus.prev_noise[-1].clone()
+                sample = self._cache_bus.prev_epsilon[-1].clone()
                 for i in range(1): # assume this is second order
-                    self._cache_bus.prev_noise[i] = self._cache_bus.prev_noise[i + 1]
-                self._cache_bus.prev_noise[-1] = sample
+                    self._cache_bus.prev_epsilon[i] = self._cache_bus.prev_epsilon[i + 1]
+                self._cache_bus.prev_epsilon[-1] = sample
                 self._cache_bus.step += 1
 
                 return UNet2DConditionOutput(sample=torch.zeros_like(sample))
@@ -842,8 +807,8 @@ def patch_unet(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
 
                 # clone the sample to cache for skipping step
                 for i in range(1):
-                    self._cache_bus.prev_noise[i] = self._cache_bus.prev_noise[i + 1]
-                self._cache_bus.prev_noise[-1] = sample
+                    self._cache_bus.prev_epsilon[i] = self._cache_bus.prev_epsilon[i + 1]
+                self._cache_bus.prev_epsilon[-1] = sample
                 self._cache_bus.step += 1
 
                 if USE_PEFT_BACKEND:
@@ -859,19 +824,13 @@ def patch_unet(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
 
 
 def hook_tome_model(model: torch.nn.Module):
-    """ Adds a forward pre hook to get the image size. This hook can be removed with remove_patch. """
-
     def hook(module, args):
         module._tome_info["size"] = (args[0].shape[2], args[0].shape[3])
         return None
-
     model._tome_info["hooks"].append(model.register_forward_pre_hook(hook))
 
 
 def generate_semi_random_indices(sy: int, sx: int, h: int, w: int, steps: int) -> list:
-    """
-    Generates a semi-random merging schedule given the grid size.
-    """
     hsy, wsx = h // sy, w // sx
     cycle_length = sy * sx
     num_cycles = -(-steps // cycle_length)
@@ -901,8 +860,9 @@ def reset_cache(model: torch.nn.Module):
     bus = diffusion_model._cache_bus
 
     bus.prev_x0 = [None, None]
+    bus.prev_xt = None
+    bus.prev_f = [None, None, None]
     bus.temporal_score = None
-    bus.prev_sample_list = [None, None]
 
     bus.prev_momentum = None
     bus.last_skip_step = 0  # align with step in cache bus
@@ -924,7 +884,10 @@ def reset_cache(model: torch.nn.Module):
 
     bus.step = 0
     bus.c_step = 1
+    bus.cons_skip = 0
 
+
+    # re-patch
     index = 0
     for _, module in diffusion_model.named_modules():
         if isinstance_str(module, "ToMeBlock"):
