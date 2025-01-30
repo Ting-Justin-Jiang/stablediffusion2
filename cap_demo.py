@@ -7,7 +7,7 @@ import torch
 import lpips
 
 from torchvision.utils import save_image
-from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
+from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler, EulerDiscreteScheduler
 from ldm.tome import patch
 import torchvision.transforms as T
 
@@ -92,8 +92,9 @@ def load_lora_weights(pipeline, checkpoint_path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default='stabilityai/stable-diffusion-2-1')  # model_id_v2_1 = 'stabilityai/stable-diffusion-2-1' 'stablediffusionapi/rev-animated' 'Meina/MeinaMix'
-    parser.add_argument("--prompt", type=str, default="A cat wearing a scarf in the snow")
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--prompt", type=str, default="Photograph of a cute kitty")
+    parser.add_argument("--solver", type=str, choices=["euler", "dpm"], default="dpm")
+    parser.add_argument("--seed", type=int, default=100)
     parser.add_argument("--height", type=int, default=768)
     parser.add_argument("--width", type=int, default=768)
     args = parser.parse_args()
@@ -104,7 +105,10 @@ if __name__ == "__main__":
     lora_path = "checkpoints/blindbox_v1_mix.safetensors"
 
     baseline_pipe = StableDiffusionPipeline.from_pretrained(args.model, torch_dtype=torch.float16).to("cuda:0")
-    baseline_pipe.scheduler = DPMSolverMultistepScheduler.from_config(baseline_pipe.scheduler.config)
+    if args.solver == "dpm":
+        baseline_pipe.scheduler = DPMSolverMultistepScheduler.from_config(baseline_pipe.scheduler.config)
+    if args.solver == "euler":
+        baseline_pipe.scheduler = EulerDiscreteScheduler.from_config(baseline_pipe.scheduler.config)
     # baseline_pipe = load_lora_weights(baseline_pipe, lora_path)
 
     logging.info("Warming up GPU...")
@@ -127,6 +131,10 @@ if __name__ == "__main__":
     # Cache-Assisted Pruning
     pipe = StableDiffusionPipeline.from_pretrained(args.model, torch_dtype=torch.float16).to("cuda:0")
     pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+    if args.solver == "dpm":
+        pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+    if args.solver == "euler":
+        pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
     # pipe = load_lora_weights(pipe, lora_path)
 
     patch.apply_patch(pipe,

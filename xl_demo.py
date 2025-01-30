@@ -9,7 +9,7 @@ logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %
 
 from torchvision.utils import save_image
 
-from diffusers import StableDiffusionXLPipeline, DPMSolverMultistepScheduler
+from diffusers import StableDiffusionXLPipeline, EulerDiscreteScheduler, DPMSolverMultistepScheduler
 import torchvision.transforms as T
 
 from ldm.tome import patch
@@ -23,7 +23,8 @@ def set_random_seed(seed):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="stabilityai/stable-diffusion-xl-base-1.0")
-    parser.add_argument("--prompt", type=str, default="A photograph of a cute racoon")
+    parser.add_argument("--prompt", type=str, default="A photograph of a cute red panda wearing a wizard hat")
+    parser.add_argument("--solver", type=str, choices=["euler", "dpm"], default="dpm")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -33,7 +34,10 @@ if __name__ == "__main__":
     baseline_pipe = StableDiffusionXLPipeline.from_pretrained(
         args.model, torch_dtype=torch.float16, variant="fp16", use_safetensors=True
     ).to("cuda:0")
-    baseline_pipe.scheduler = DPMSolverMultistepScheduler.from_config(baseline_pipe.scheduler.config)
+    if args.solver == "dpm":
+        baseline_pipe.scheduler = DPMSolverMultistepScheduler.from_config(baseline_pipe.scheduler.config)
+    if args.solver == "euler":
+        baseline_pipe.scheduler = EulerDiscreteScheduler.from_config(baseline_pipe.scheduler.config)
 
     # Warmup GPU. Only for testing the speed.
     logging.info("Warming up GPU...")
@@ -57,14 +61,17 @@ if __name__ == "__main__":
     pipe = StableDiffusionXLPipeline.from_pretrained(
         args.model, torch_dtype=torch.float16, variant="fp16", use_safetensors=True
     ).to("cuda:0")
-    pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+    if args.solver == "dpm":
+        pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+    if args.solver == "euler":
+        pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
 
 
     patch.apply_patch(pipe,
                       ratio=0.99,
                       mode="cache_merge",
                       sx=3, sy=3,
-                      max_downsample=1,
+                      max_downsample=2,
                       acc_range=(9, 45),
                       push_unmerged=True,
                       prune=True,

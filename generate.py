@@ -16,6 +16,8 @@ from torchmetrics.multimodal.clip_score import CLIPScore
 from pytorch_fid.fid_score import calculate_fid_given_paths
 from torchvision.transforms.functional import to_pil_image
 
+from diffusers import DPMSolverMultistepScheduler, EulerDiscreteScheduler
+
 from ldm.tome import patch
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -38,16 +40,22 @@ def main(args):
     prompts = prompts[:args.num_fid_samples]
 
     if args.model == "stabilityai/stable-diffusion-2-1":
-        from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
+        from diffusers import StableDiffusionPipeline
         pipe = StableDiffusionPipeline.from_pretrained(args.model, torch_dtype=torch.float16, safety_checker=None).to("cuda:0")
-        pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+        if args.solver == "dpm":
+            pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+        if args.solver == "euler":
+            pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
         max_downsample = 1
         image_size = 768
 
     elif args.model == "stabilityai/stable-diffusion-xl-base-1.0":
-        from diffusers import StableDiffusionXLPipeline, DPMSolverMultistepScheduler
+        from diffusers import StableDiffusionXLPipeline
         pipe = StableDiffusionXLPipeline.from_pretrained(args.model, torch_dtype=torch.float16, safety_checker=None).to("cuda:0")
-        pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+        if args.solver == "dpm":
+            pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+        if args.solver == "euler":
+            pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
         max_downsample = 2
         image_size = 1024
 
@@ -147,6 +155,7 @@ if __name__ == '__main__':
     parser.add_argument("--num-fid-samples", type=int, default=30)
     parser.add_argument('--experiment-folder', type=str, default='samples/inference/cap')
     parser.add_argument('--target-folder', type=str, default='samples/data/val2017')
+    parser.add_argument("--solver", type=str, choices=["euler", "dpm"], default="euler")
 
     # == Acceleration Setup ==
     parser.add_argument("--method", type=str, choices=["original", "deep_cache", "cap"], default="cap")

@@ -9,6 +9,7 @@ from .merge import *
 from .utils import isinstance_str, init_generator
 
 from diffusers.utils import USE_PEFT_BACKEND, BaseOutput, scale_lora_layers, unscale_lora_layers
+from diffusers.utils.torch_utils import randn_tensor
 from dataclasses import dataclass
 
 
@@ -20,6 +21,13 @@ class UNet2DConditionOutput(BaseOutput):
 @dataclass
 class SchedulerOutput(BaseOutput):
     prev_sample: torch.FloatTensor
+
+
+@dataclass
+# Copied from diffusers.schedulers.scheduling_ddpm.DDPMSchedulerOutput with DDPM->EulerDiscrete
+class EulerDiscreteSchedulerOutput(BaseOutput):
+    prev_sample: torch.FloatTensor
+    pred_original_sample: Optional[torch.FloatTensor] = None
 
 
 class CacheBus:
@@ -134,6 +142,163 @@ def compute_prune(x: torch.Tensor, mode: str, tome_info: Dict[str, Any], cache: 
 
 
 def patch_solver(solver_class):
+    class PatchedEulerDiscreteScheduler(solver_class):
+        def step(
+                self,
+                model_output: torch.FloatTensor,
+                timestep: Union[float, torch.FloatTensor],
+                sample: torch.FloatTensor,
+                s_churn: float = 0.0,
+                s_tmin: float = 0.0,
+                s_tmax: float = float("inf"),
+                s_noise: float = 1.0,
+                generator: Optional[torch.Generator] = None,
+                return_dict: bool = True,
+        ) -> Union[EulerDiscreteSchedulerOutput, Tuple]:
+
+            if self.step_index is None:
+                self._init_step_index(timestep)
+
+            sigma = self.sigmas[self.step_index]
+            gamma = min(s_churn / (len(self.sigmas) - 1), 2 ** 0.5 - 1) if s_tmin <= sigma <= s_tmax else 0.0
+            noise = randn_tensor(model_output.shape, dtype=model_output.dtype, device=model_output.device,
+                                 generator=generator)
+
+            eps = noise * s_noise
+            sigma_hat = sigma * (gamma + 1)
+
+            if gamma > 0:
+                sample = sample + eps * (sigma_hat ** 2 - sigma ** 2) ** 0.5
+
+            # == Conduct the step skipping identified from last step == #
+            if self._cache_bus.skip_this_step and self._cache_bus.pred_m_m_1 is not None:
+                pred_original_sample = self._cache_bus.pred_m_m_1
+                self._cache_bus.skip_this_step = False
+            else:
+
+                if self.config.prediction_type == "original_sample" or self.config.prediction_type == "sample":
+                    pred_original_sample = model_output
+                elif self.config.prediction_type == "epsilon":
+                    pred_original_sample = sample - sigma_hat * model_output
+                elif self.config.prediction_type == "v_prediction":
+                    # denoised = model_output * c_out + input * c_skip
+                    pred_original_sample = model_output * (-sigma / (sigma ** 2 + 1) ** 0.5) + (sample / (sigma ** 2 + 1))
+                else:
+                    raise ValueError(f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, or `v_prediction`")
+
+            # == Patch begin
+            N = self.timesteps.shape[0]
+
+            sigma_t, sigma_s0, sigma_s1 = (
+                self.sigmas[self.step_index + 1] / (torch.sqrt(1 + self.sigmas[self.step_index + 1] ** 2)),
+                self.sigmas[self.step_index] / (torch.sqrt(1 + self.sigmas[self.step_index] ** 2)),
+                self.sigmas[self.step_index - 1] / (torch.sqrt(1 + self.sigmas[self.step_index - 1] ** 2)),
+            )
+
+            self.betas = self.betas.to('cuda')
+
+            beta_n = self.betas[int(self.timesteps[self.step_index - 1])]
+            beta_n_1 = self.betas[int(self.timesteps[min(N - 1, self.step_index)])]
+            beta_n_m1 = self.betas[int(self.timesteps[self.step_index - 2])]
+
+            s_alpha_cumprod_n = torch.sqrt(self.alphas[int(self.timesteps[self.step_index - 1])])
+            s_alpha_cumprod_n_1 = torch.sqrt(self.alphas[int(self.timesteps[min(N - 1, self.step_index)])])
+            s_alpha_cumprod_n_m1 = torch.sqrt(self.alphas[int(self.timesteps[self.step_index - 2])])
+
+            delta = 1 / N  # step size correlates with number of inference step
+
+            m0 = pred_original_sample / s_alpha_cumprod_n
+
+            if m0.shape[-1] == 128:
+                guidance = 5.0
+            else: guidance = 7.5
+
+            epsilon_0 = self._cache_bus.prev_epsilon[-1][0] + guidance * (
+                    self._cache_bus.prev_epsilon[-1][1] - self._cache_bus.prev_epsilon[-1][0])
+
+            # == Criteria == #
+            f = (- 0.5 * beta_n * N * sample) + (0.5 * beta_n * N / sigma_s0) * epsilon_0
+
+            if self._cache_bus.prev_f[0] is not None:
+                max_interval = self._cache_bus._tome_info['args']['max_interval']
+                acc_range = self._cache_bus._tome_info['args']['acc_range']
+
+                momentum = (self._cache_bus.prev_f[-1] - self._cache_bus.prev_f[-2]) - (self._cache_bus.prev_f[-2] - self._cache_bus.prev_f[-3])
+                momentum_mean = momentum.mean()
+                self._cache_bus.rel_momentum_list.append((momentum_mean.item()))
+
+                if self._cache_bus.cons_skip >= max_interval:
+                    self._cache_bus.skip_this_step = False
+                    self._cache_bus.cons_skip = 0
+
+                elif momentum_mean <= 0 and self._cache_bus.step in range(acc_range[0], acc_range[1]):
+                    # == Here we skip step
+                    self._cache_bus.skip_this_step = True
+
+                    # Calculate m_m_1
+                    m1 = self._cache_bus.prev_x0[-1]
+                    epsilon_1 = self._cache_bus.prev_epsilon[-2][0] + guidance * (self._cache_bus.prev_epsilon[-2][1] - self._cache_bus.prev_epsilon[-2][0])
+
+                    # == Calculate the future data prediction in a Adam Moulton fashion ==
+                    term_1 = (1 + 0.25 * delta * N * beta_n) * s_alpha_cumprod_n * m0
+                    term_2 = 0.25 * delta * N * beta_n_1 * s_alpha_cumprod_n_1 * m1
+                    term_3 = ((1 + 0.25 * delta * N * beta_n) * sigma_s0 - sigma_s1 - (delta * N * beta_n) / (4 * sigma_s0)) * epsilon_0
+                    term_4 = (0.25 * delta * N * beta_n_1 * sigma_t - (delta * N * beta_n_1) / (4 * sigma_t)) * epsilon_1
+
+                    m_m_1 = (term_1 + term_2 + term_3 + term_4) / s_alpha_cumprod_n_m1
+                    self._cache_bus.pred_m_m_1 = m_m_1.clone()
+
+                    self._cache_bus.cons_skip += 1
+
+                else:
+                    self._cache_bus.skip_this_step = False
+                    self._cache_bus.cons_skip = 0
+
+                # Here we conduct token-wise pruning:
+                if not self._cache_bus.skip_this_step:
+                    # == Define the masking on pruning
+                    max_fix = self._cache_bus._tome_info['args']['max_fix']
+
+                    momentum_mean = momentum.mean(dim=1)
+                    momentum_flat = momentum_mean.view(-1)
+                    mask = momentum_flat >= 0
+                    num_mask = mask.sum().item()
+                    score = torch.zeros_like(momentum_flat)
+
+                    if num_mask > max_fix:
+                        _, topk_indices = torch.topk(momentum_flat, max_fix, largest=True, sorted=False)
+                        score[topk_indices] = 1.0
+                    else:
+                        score[mask] = 1.0
+
+                    self._cache_bus.temporal_score = score.view_as(momentum_mean)
+
+            for i in range(2):
+                self._cache_bus.prev_f[i] = self._cache_bus.prev_f[i + 1]
+            self._cache_bus.prev_f[-1] = f
+
+            for j in range(1):
+                self._cache_bus.prev_x0[j] = self._cache_bus.prev_x0[j + 1]
+            self._cache_bus.prev_x0[-1] = m0
+            self._cache_bus.prev_xt = sample
+            # == Patch end ==
+
+            # 2. Convert to an ODE derivative
+            derivative = (sample - pred_original_sample) / sigma_hat
+
+            dt = self.sigmas[self.step_index + 1] - sigma_hat
+
+            prev_sample = sample + derivative * dt
+
+            # upon completion increase step index by one
+            self._step_index += 1
+
+            if not return_dict:
+                return (prev_sample,)
+
+            return EulerDiscreteSchedulerOutput(prev_sample=prev_sample, pred_original_sample=pred_original_sample)
+
+
     class PatchedDPMSolverMultistepScheduler(solver_class):
         def step(
                 self,
@@ -169,6 +334,10 @@ def patch_solver(solver_class):
 
             m0 = model_output
 
+            if m0.shape[-1] == 128:
+                guidance = 5.0
+            else: guidance = 7.5
+
             N = self.timesteps.shape[0]
 
             sigma_t, sigma_s0, sigma_s1 = (
@@ -191,7 +360,7 @@ def patch_solver(solver_class):
 
             delta = 1 / N  # step size correlates with number of inference step
 
-            epsilon_0 = self._cache_bus.prev_epsilon[-1][0] + 5.0 * (self._cache_bus.prev_epsilon[-1][1] - self._cache_bus.prev_epsilon[-1][0])
+            epsilon_0 = self._cache_bus.prev_epsilon[-1][0] + guidance * (self._cache_bus.prev_epsilon[-1][1] - self._cache_bus.prev_epsilon[-1][0])
 
             # == Criteria == #
             f = (- 0.5 * beta_n * N * sample) + (0.5 * beta_n * N / sigma_s0) * epsilon_0
@@ -217,7 +386,7 @@ def patch_solver(solver_class):
                     m2 = self._cache_bus.prev_x0[-2]
 
                     # CFG to the noise
-                    epsilon_1 = self._cache_bus.prev_epsilon[-2][0] + 5.0 * (
+                    epsilon_1 = self._cache_bus.prev_epsilon[-2][0] + guidance * (
                                 self._cache_bus.prev_epsilon[-2][1] - self._cache_bus.prev_epsilon[-2][0])
 
                     # == Calculate the future data prediction in a Adam Moulton fashion ==
@@ -310,8 +479,7 @@ def patch_solver(solver_class):
             if self.config.solver_order == 1 or self.lower_order_nums < 1 or lower_order_final:
                 prev_sample = self.dpm_solver_first_order_update(model_output, sample=sample, noise=noise)
             elif self.config.solver_order == 2 or self.lower_order_nums < 2 or lower_order_second:
-                prev_sample = self.multistep_dpm_solver_second_order_update(self.model_outputs, sample=sample,
-                                                                            noise=noise)
+                prev_sample = self.multistep_dpm_solver_second_order_update(self.model_outputs, sample=sample, noise=noise)
             else:
                 prev_sample = self.multistep_dpm_solver_third_order_update(self.model_outputs, sample=sample)
 
@@ -391,8 +559,12 @@ def patch_solver(solver_class):
             # self._cache_bus.c_step += 1
 
             return x_t
+    if solver_class.__name__ == "EulerDiscreteScheduler":
+        return PatchedEulerDiscreteScheduler
+    if solver_class.__name__ == "DPMSolverMultistepScheduler":
+        return PatchedDPMSolverMultistepScheduler
+    else: raise NotImplementedError
 
-    return PatchedDPMSolverMultistepScheduler
 
 
 def make_tome_block(block_class: Type[torch.nn.Module], mode: str = 'token_merge') -> Type[torch.nn.Module]:
