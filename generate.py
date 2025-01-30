@@ -37,33 +37,34 @@ def main(args):
 
     prompts = prompts[:args.num_fid_samples]
 
-    if args.method != "deep_cache":
+    if args.model == "stabilityai/stable-diffusion-2-1":
         from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
         pipe = StableDiffusionPipeline.from_pretrained(args.model, torch_dtype=torch.float16, safety_checker=None).to("cuda:0")
         pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
-    else:
-        from diffusers import DPMSolverMultistepScheduler
-        from DeepCache.sd.pipeline_stable_diffusion import StableDiffusionPipeline
-        pipe = StableDiffusionPipeline.from_pretrained(args.model, torch_dtype=torch.float16).to("cuda:0")
+        max_downsample = 1
+        image_size = 768
 
-    if args.merge_ratio > 0.0:
+    elif args.model == "stabilityai/stable-diffusion-xl-base-1.0":
+        from diffusers import StableDiffusionXLPipeline, DPMSolverMultistepScheduler
+        pipe = StableDiffusionXLPipeline.from_pretrained(args.model, torch_dtype=torch.float16, safety_checker=None).to("cuda:0")
+        pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+        max_downsample = 2
+        image_size = 1024
+
+    else: raise NotImplementedError
+
+    if args.method == 'cap':
         patch.apply_patch(pipe,
-                          ratio=args.merge_ratio,
-                          mode=args.merge_mode,
-                          prune=args.prune,
+                          ratio=0.99,
+                          mode="cache_merge",
                           sx=3, sy=3,
-                          max_downsample=1,
-                          latent_size=(2 * math.ceil(768 // 16),
-                                       2 * math.ceil(768 // 16)),
-                          merge_step=args.merge_step,
-                          cache_step=args.cache_step,
-                          push_unmerged=args.push_unmerged,
+                          max_downsample=max_downsample,
+                          acc_range=(9, 45),
+                          push_unmerged=True,
+                          prune=True,
 
-                          threshold_map=args.threshold_map,
-                          threshold_token=args.threshold_token,
                           max_fix=args.max_fix,
-                          cache_interval=args.cache_interval
-                          )
+                          max_interval=args.max_interval)
 
 
     # Initialize metric
@@ -116,7 +117,7 @@ def main(args):
             image.save(f"{output_dir}/{global_image_index}.jpg")  # Use global index
             global_image_index += 1
 
-        if args.merge_ratio > 0.0:
+        if args.method == 'cap':
             patch.reset_cache(pipe)
 
     print(f"Done: use_time = {use_time}")
@@ -129,7 +130,7 @@ def main(args):
         [args.target_folder, args.experiment_folder],
         1,
         "cuda:0",
-        dims=768,
+        dims=image_size,
         num_workers=8,
     )
     print(f"FID: {fid_value}")
@@ -138,39 +139,20 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # == Sampling setup ==
-    parser.add_argument("--model", type=str, default='stabilityai/stable-diffusion-2-1')
+    parser.add_argument("--model", type=str, default='stabilityai/stable-diffusion-xl-base-1.0') #stabilityai/stable-diffusion-xl-base-1.0  #stabilityai/stable-diffusion-2-1
     parser.add_argument("--dataset", type=str, default="coco2017")
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--seed", type=int, default=3704)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num-fid-samples", type=int, default=30)
-    parser.add_argument('--experiment-folder', type=str, default='samples/experiment/macap')
+    parser.add_argument('--experiment-folder', type=str, default='samples/inference/cap')
     parser.add_argument('--target-folder', type=str, default='samples/data/val2017')
 
     # == Acceleration Setup ==
     parser.add_argument("--method", type=str, choices=["original", "deep_cache", "cap"], default="cap")
 
-    # Hyperparameters for DeepCache
-    parser.add_argument("--layer", type=int, default=0)
-    parser.add_argument("--block", type=int, default=0)
-    parser.add_argument("--update_interval", type=int, default=5)
-    parser.add_argument("--uniform", action="store_true", default=True)
-    parser.add_argument("--pow", type=float, default=1.4)
-    parser.add_argument("--center", type=int, default=15)
-
-    # Hyperparameters for CAP (old)
-    parser.add_argument("--merge-ratio", type=float, default=0.99)
-    parser.add_argument("--merge-mode", type=str, choices=["token_merge", "cache_merge"], default="cache_merge")
-    parser.add_argument("--prune", action=argparse.BooleanOptionalAction, type=bool, default=True)
-    parser.add_argument("--merge-step", type=lambda s: (int(item) for item in s.split(',')), default=(3, 49))
-    parser.add_argument("--cache-step", type=lambda s: (int(item) for item in s.split(',')), default=(3, 49))
-    parser.add_argument("--push-unmerged", action=argparse.BooleanOptionalAction, type=bool, default=True)
-
-    # Hyperparameters for MACAP (new)
-    parser.add_argument("--threshold-token", type=float, default=0.15)
-    parser.add_argument("--threshold-map", type=float, default=0.025)
-    parser.add_argument("--max-fix", type=int, default=1024 * 6)
-    parser.add_argument("--cache-interval", type=int, default=3)
+    parser.add_argument("--max-fix", type=int, default=1024 * 10)
+    parser.add_argument("--max-interval", type=int, default=3)
 
     args = parser.parse_args()
     set_random_seed(args.seed)

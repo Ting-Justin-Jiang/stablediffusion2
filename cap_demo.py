@@ -11,8 +11,6 @@ from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
 from ldm.tome import patch
 import torchvision.transforms as T
 
-from DeepCache.sd.pipeline_stable_diffusion import StableDiffusionPipeline as DeepCacheStableDiffusionPipeline
-
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
@@ -94,8 +92,8 @@ def load_lora_weights(pipeline, checkpoint_path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default='stabilityai/stable-diffusion-2-1')  # model_id_v2_1 = 'stabilityai/stable-diffusion-2-1' 'stablediffusionapi/rev-animated' 'Meina/MeinaMix'
-    parser.add_argument("--prompt", type=str, default="a Nissan Skyline parked in the night market street of Hong Kong Kowloon city")
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--prompt", type=str, default="A cat wearing a scarf in the snow")
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--height", type=int, default=768)
     parser.add_argument("--width", type=int, default=768)
     args = parser.parse_args()
@@ -134,19 +132,14 @@ if __name__ == "__main__":
     patch.apply_patch(pipe,
                         ratio=0.99,
                         mode="cache_merge",
-                        sx=2, sy=2,
+                        sx=3, sy=3,
                         max_downsample=1,
-                        latent_size=(2 * math.ceil(args.height / 16),
-                                     2 * math.ceil(args.width / 16)),
-                        merge_step=(3, 50),
-                        cache_step=(3, 50),
+                        acc_range=(9, 45),
                         push_unmerged=True,
                         prune=True,
 
-                        threshold_map=0.002,
-                        threshold_token=0.15,
-                        max_fix=1024*5,
-                        cache_interval=3
+                        max_fix=1024 * 5,
+                        max_interval=3
                         )
 
     logging.info("Warming up GPU...")

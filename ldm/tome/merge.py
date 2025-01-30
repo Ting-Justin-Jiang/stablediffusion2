@@ -154,8 +154,6 @@ def deprecated_bipartite_soft_matching_random2d(metric: torch.Tensor,
 
         # Simply concat
         out = torch.cat([unm, dst], dim=1)
-        print(f"\033[96mMerge\033[0m: feature map merged from \033[95m{x.shape}\033[0m to \033[95m{out.shape}\033[0m "
-                      f"at block index: \033[91m{cache.index}\033[0m")
         return out
 
     def unmerge(x: torch.Tensor, unmerge_mode=unmerge_mode, cache=cache) -> torch.Tensor:
@@ -215,14 +213,15 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
 
     B, N, _ = metric.shape
 
-    if cache.cache_bus.step < tome_info['args']['merge_start'] or cache.cache_bus.step > tome_info['args']['merge_end']:
+    if cache.cache_bus.step not in range(tome_info['args']['acc_range'][0], tome_info['args']['acc_range'][1]):
         return do_nothing, do_nothing
     else:
-        if tome_info['args']['merge_start'] > cache.cache_bus.last_skip_step and (
-                cache.cache_bus.step - tome_info['args']['merge_start']) % tome_info['args']['cache_interval'] == 0:
+        acc_start = tome_info['args']['acc_range'][0]
+        max_interval = tome_info['args']['max_interval']
+
+        if acc_start > cache.cache_bus.last_skip_step and (cache.cache_bus.step - acc_start) % max_interval == 0:
             return do_nothing, push_all
-        elif tome_info['args']['merge_start'] <= cache.cache_bus.last_skip_step and (
-                cache.cache_bus.step - cache.cache_bus.last_skip_step - 1) % tome_info['args']['cache_interval'] == 0: # should be off by one
+        elif acc_start <= cache.cache_bus.last_skip_step and (cache.cache_bus.step - cache.cache_bus.last_skip_step - 1) % max_interval == 0: # should be off by one
             return do_nothing, push_all
 
     gather = mps_gather_workaround if metric.device.type == "mps" else torch.gather
@@ -285,7 +284,6 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
         n, t1, c = src.shape
         unm = gather(src, dim=-2, index=unm_idx.expand(n, t1 - r, c))
         out = torch.cat([unm, dst], dim=1)
-        print(f"\033[96mMerge\033[0m: feature map merged from \033[95m{x.shape}\033[0m to \033[95m{out.shape}\033[0m "f"at block index: \033[91m{cache.index}\033[0m")
         return out
 
     def reconstruct(x: torch.Tensor, unmerge_mode=unmerge_mode, cache=cache) -> torch.Tensor:
@@ -293,7 +291,7 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
         unm, dst = x[..., :unm_len, :], x[..., unm_len:, :]
         _, _, c = unm.shape
 
-        if unmerge_mode == 'cache_merge' and tome_info['args']['cache_start'] <= cache.cache_bus.step <= tome_info['args']['cache_end']:
+        if unmerge_mode == 'cache_merge' and cache.cache_bus.step in range(tome_info['args']['acc_range'][0], tome_info['args']['acc_range'][1]):
             cache.push(dst, index=b_idx.expand(B, num_dst, c))
             src = cache.pop(index=gather(a_idx.expand(B, a_idx.shape[1], 1), dim=1, index=src_idx).expand(B, r, c))
         else:

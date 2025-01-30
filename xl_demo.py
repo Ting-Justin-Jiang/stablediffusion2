@@ -23,8 +23,8 @@ def set_random_seed(seed):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="stabilityai/stable-diffusion-xl-base-1.0")
-    parser.add_argument("--prompt", type=str, default="a Nissan Skyline parked in the night market street of Hong Kong city")
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--prompt", type=str, default="A photograph of a cute racoon")
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     seed = args.seed
@@ -64,17 +64,13 @@ if __name__ == "__main__":
                       ratio=0.99,
                       mode="cache_merge",
                       sx=3, sy=3,
-                      max_downsample=0,
-                      latent_size=(2 * math.ceil(1024 / 16), 2 * math.ceil(1024 / 16)),
-                      merge_step=(7, 45),
-                      cache_step=(7, 45),
+                      max_downsample=1,
+                      acc_range=(9, 45),
                       push_unmerged=True,
                       prune=True,
 
-                      threshold_map=0.002,
-                      threshold_token=0.2,
-                      max_fix=1024 * 12,
-                      cache_interval=3)
+                      max_fix=1024 * 8,
+                      max_interval=3)
 
 
     # Warmup GPU. Only for testing the speed.

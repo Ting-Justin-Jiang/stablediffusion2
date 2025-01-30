@@ -26,8 +26,6 @@ class CacheBus:
     """A Bus class for overall control."""
 
     def __init__(self):
-        self.rand_indices = {}  # key: index, value: rand_idx
-
         # == Variable Caching ==
         self.prev_x0 = [None, None]
         self.prev_xt = None
@@ -69,28 +67,21 @@ class CacheBus:
 class Cache:
     def __init__(self, index: int, cache_bus: CacheBus, broadcast_range: int = 1):
         self.cache_bus = cache_bus
-
         self.feature_map = None
-        self.feature_map_mlp = None
-
         self.index = index
-        self.rand_indices = None
 
     # == 1. Cache Merge Operations == #
     def push(self, x: torch.Tensor, index: torch.Tensor = None) -> None:
         if index is None:
             # x would be the entire feature map during the first cache update
             self.feature_map = x
-            if DEBUG_MODE: print(f"\033[96mCache Push\033[0m: Initial push x: \033[95m{x.shape}\033[0m to cache index: \033[91m{self.index}\033[0m")
         else:
             # x would be the dst (updated) tokens during subsequent cache updates
             self.feature_map.scatter_(dim=-2, index=index, src=x)
-            if DEBUG_MODE: print(f"\033[96mCache Push\033[0m: Push x: \033[95m{x.shape}\033[0m to cache index: \033[91m{self.index}\033[0m")
 
     def pop(self, index: torch.Tensor) -> torch.Tensor:
         # Retrieve the src tokens from the cached feature map
         x = torch.gather(self.feature_map, dim=-2, index=index)
-        if DEBUG_MODE: print(f"\033[96mCache Pop\033[0m: Pop x: \033[95m{x.shape}\033[0m to cache index: \033[91m{self.index}\033[0m")
         return x
 
 
@@ -126,14 +117,7 @@ def compute_prune(x: torch.Tensor, mode: str, tome_info: Dict[str, Any], cache: 
             # If the batch size is odd, then it's not possible for prompted and unprompted images to be in the same
             # batch, which causes artifacts with use_rand, so force it to be off.
             use_rand = False if x.shape[0] % 2 == 1 else args["use_rand"]
-
-            # retrieve semi-random merging schedule
-            if mode == 'cache_merge_deprecated':
-                if cache.rand_indices is None:
-                    cache.rand_indices = cache.cache_bus.rand_indices[cache.index].copy()
-                rand_indices = cache.rand_indices
-            else:
-                rand_indices = None
+            rand_indices = None
 
             # the function defines the indices to prune
             m, u = bipartite_soft_matching_random2d(x, w, h, args["sx"], args["sy"], r, tome_info,
@@ -209,56 +193,65 @@ def patch_solver(solver_class):
 
             epsilon_0 = self._cache_bus.prev_epsilon[-1][0] + 5.0 * (self._cache_bus.prev_epsilon[-1][1] - self._cache_bus.prev_epsilon[-1][0])
 
-            if self._cache_bus.prev_x0[0] is not None:
-                m1 = self._cache_bus.prev_x0[-1]
-                m2 = self._cache_bus.prev_x0[-2]
-
-                # CFG to the noise
-                epsilon_1 = self._cache_bus.prev_epsilon[-2][0] + 5.0 * (self._cache_bus.prev_epsilon[-2][1] - self._cache_bus.prev_epsilon[-2][0])
-
-                # == Calculate the future data prediction in a Adam Moulton fashion ==
-                term_1 = (1 + 0.25 * delta * N * beta_n) * s_alpha_cumprod_n * m0
-                term_2 = 0.25 * delta * N * beta_n_1 * s_alpha_cumprod_n_1 * m1
-                term_3 = ((1 + 0.25 * delta * N * beta_n) * sigma_s0 - sigma_s1 - (delta * N * beta_n) / (4 * sigma_s0)) * epsilon_0
-                term_4 = (0.25 * delta * N * beta_n_1 * sigma_t - (delta * N * beta_n_1) / (4 * sigma_t)) * epsilon_1
-
-                m_m_1 = (term_1 + term_2 + term_3 + term_4) / s_alpha_cumprod_n_m1
-
-                # calculate MSE for our prediction
-                if self._cache_bus.pred_m_m_1 is not None:
-                    error = ((self._cache_bus.pred_m_m_1 - m0) ** 2).mean()
-                    print(f"\n Our Approximation error - : {error}")
-                    self._cache_bus.pred_error_list.append(float(error.item()))
-                    print(self._cache_bus.pred_error_list)
-                self._cache_bus.pred_m_m_1 = m_m_1.clone()
-
-                # calculate MSE for taylor prediction
-                taylor_m_m_1 = m0 + (m0 - m1) + 0.5 * (m0 - 2 * m1 + m2)
-                if self._cache_bus.taylor_m_m_1 is not None:
-                    taylor_error = ((self._cache_bus.taylor_m_m_1 - m0) ** 2).mean()
-                    print(f"\n Taylor Approximation error - : {taylor_error}")
-                    self._cache_bus.taylor_error_list.append(float(taylor_error.item()))
-                    print(self._cache_bus.taylor_error_list)
-                self._cache_bus.taylor_m_m_1 = taylor_m_m_1.clone()
-
-                # # only for testing
-                if self._cache_bus._tome_info['args']['test_skip_path'] and self._cache_bus.step in self._cache_bus._tome_info['args']['test_skip_path']:
-                    self._cache_bus.skip_this_step = True
-
+            # == Criteria == #
             f = (- 0.5 * beta_n * N * sample) + (0.5 * beta_n * N / sigma_s0) * epsilon_0
 
             if self._cache_bus.prev_f[0] is not None:
+                max_interval = self._cache_bus._tome_info['args']['max_interval']
+                acc_range = self._cache_bus._tome_info['args']['acc_range']
+
                 momentum = (self._cache_bus.prev_f[-1] - self._cache_bus.prev_f[-2]) - (self._cache_bus.prev_f[-2] - self._cache_bus.prev_f[-3])
                 momentum_mean = momentum.mean()
                 self._cache_bus.rel_momentum_list.append((momentum_mean.item()))
 
-                if self._cache_bus.cons_skip >= 3:
+                if self._cache_bus.cons_skip >= max_interval:
                     self._cache_bus.skip_this_step = False
                     self._cache_bus.cons_skip = 0
 
-                elif momentum_mean <= 0 and self._cache_bus.step in range(7, 45):
+                elif momentum_mean <= 0 and self._cache_bus.step in range(acc_range[0], acc_range[1]):
+                    # == Here we skip step
                     self._cache_bus.skip_this_step = True
-                    # Should actually calculate m_m_1 here
+
+                    # Calculate m_m_1
+                    m1 = self._cache_bus.prev_x0[-1]
+                    m2 = self._cache_bus.prev_x0[-2]
+
+                    # CFG to the noise
+                    epsilon_1 = self._cache_bus.prev_epsilon[-2][0] + 5.0 * (
+                                self._cache_bus.prev_epsilon[-2][1] - self._cache_bus.prev_epsilon[-2][0])
+
+                    # == Calculate the future data prediction in a Adam Moulton fashion ==
+                    term_1 = (1 + 0.25 * delta * N * beta_n) * s_alpha_cumprod_n * m0
+                    term_2 = 0.25 * delta * N * beta_n_1 * s_alpha_cumprod_n_1 * m1
+                    term_3 = ((1 + 0.25 * delta * N * beta_n) * sigma_s0 - sigma_s1 - (delta * N * beta_n) / (4 * sigma_s0)) * epsilon_0
+                    term_4 = (0.25 * delta * N * beta_n_1 * sigma_t - (delta * N * beta_n_1) / (4 * sigma_t)) * epsilon_1
+
+                    m_m_1 = (term_1 + term_2 + term_3 + term_4) / s_alpha_cumprod_n_m1
+
+                    # calculate MSE for our prediction
+                    if False:
+                        if self._cache_bus.pred_m_m_1 is not None:
+                            error = ((self._cache_bus.pred_m_m_1 - m0) ** 2).mean()
+                            print(f"\n Our Approximation error - : {error}")
+                            self._cache_bus.pred_error_list.append(float(error.item()))
+                            print(self._cache_bus.pred_error_list)
+                    self._cache_bus.pred_m_m_1 = m_m_1.clone()
+
+                    # calculate MSE for taylor prediction
+                    if False:
+                        taylor_m_m_1 = m0 + (m0 - m1) + 0.5 * (m0 - 2 * m1 + m2)
+                        if self._cache_bus.taylor_m_m_1 is not None:
+                            taylor_error = ((self._cache_bus.taylor_m_m_1 - m0) ** 2).mean()
+                            print(f"\n Taylor Approximation error - : {taylor_error}")
+                            self._cache_bus.taylor_error_list.append(float(taylor_error.item()))
+                            print(self._cache_bus.taylor_error_list)
+                        self._cache_bus.taylor_m_m_1 = taylor_m_m_1.clone()
+
+                    # # only for testing
+                    if self._cache_bus._tome_info['args']['test_skip_path'] and self._cache_bus.step in \
+                            self._cache_bus._tome_info['args']['test_skip_path']:
+                        self._cache_bus.skip_this_step = True
+
                     self._cache_bus.cons_skip += 1
 
                 else:
@@ -282,7 +275,7 @@ def patch_solver(solver_class):
                     # self._cache_bus.pred_epsilon = pred_epsilon
 
                     # == Define the masking on pruning
-                    max_fix = int(momentum.shape[-1] * momentum.shape[-2] * 0.6)
+                    max_fix = self._cache_bus._tome_info['args']['max_fix']
 
                     momentum_mean = momentum.mean(dim=1)
                     momentum_flat = momentum_mean.view(-1)
@@ -516,9 +509,6 @@ def patch_unet(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
 
             skip_this_step = self._cache_bus.skip_this_step
             if skip_this_step and self._cache_bus.prev_epsilon[-1] is not None:
-                print("======================================")
-                print("\033[96mDEBUG\033[0m: Skip step")
-                print("======================================")
                 self._cache_bus.last_skip_step = self._cache_bus.step  # todo dis-alignment between bus and cache
                 self._cache_bus.skipping_path.append(self._cache_bus.step)
 
@@ -830,25 +820,6 @@ def hook_tome_model(model: torch.nn.Module):
     model._tome_info["hooks"].append(model.register_forward_pre_hook(hook))
 
 
-def generate_semi_random_indices(sy: int, sx: int, h: int, w: int, steps: int) -> list:
-    hsy, wsx = h // sy, w // sx
-    cycle_length = sy * sx
-    num_cycles = -(-steps // cycle_length)
-
-    num_positions = hsy * wsx
-
-    # Generate random permutations for all positions
-    random_numbers = torch.rand(num_positions, num_cycles * cycle_length)
-    indices = random_numbers.argsort(dim=1)
-    indices = indices[:, :steps] % cycle_length  # Map indices to [0, cycle_length - 1]
-
-    # Reshape to (hsy, wsx, steps)
-    indices = indices.view(hsy, wsx, steps)
-
-    rand_idx = [indices[:, :, step].unsqueeze(-1) for step in range(steps)]
-    return rand_idx
-
-
 def reset_cache(model: torch.nn.Module):
     is_diffusers = isinstance_str(model, "DiffusionPipeline") or isinstance_str(model, "ModelMixin")
     if not is_diffusers:
@@ -900,29 +871,25 @@ def reset_cache(model: torch.nn.Module):
 def apply_patch(
         model: torch.nn.Module,
         ratio: float = 0.5,
-        mode: str = "token_merge",
+        mode: str = "cache_merge",
         prune: bool = "true",
         max_downsample: int = 1,
         sx: int = 2, sy: int = 2,
         use_rand: bool = True,
 
-        latent_size: Tuple[int, int] = (96, 96),
-        merge_step: Tuple[int, int] = (1, 49),
-        cache_step: Tuple[int, int] = (1, 49),
+        acc_range: Tuple[int, int] = (7, 45),
         push_unmerged: bool = True,
 
         test_skip_path: List[int] = None,
         max_fix: int = 5 * 1024,
-        threshold_token: float = 0.15,
-        threshold_map: float = 0.015,
-        cache_interval: int = 3,
+        max_interval: int = 3,
 ):
     # == merging preparation ==
     global DEBUG_MODE
     if DEBUG_MODE: print('Start with \033[95mDEBUG\033[0m mode')
     print('\033[94mApplying Token Merging\033[0m')
 
-    cache_start = max(cache_step[0], 1)  # Make sure to avoid cache access in the first step
+    acc_start = max(acc_range[0], 3)
 
     # Make sure the module is not currently patched
     remove_patch(model)
@@ -947,15 +914,11 @@ def apply_patch(
         f"mode: {mode}\n"
         f"sx: {sx}, sy: {sy}\n"
         f"use_rand: {use_rand}\n"
-        f"latent_size: {latent_size}\n"
-        f"merge_step: {merge_step}\n"
-        f"cache_step: {cache_start, cache_step[-1]}\n"
+        f"acc_range: {acc_start, acc_range[-1]}\n"
         f"push_unmerged: {push_unmerged}\n"
 
-        f"threshold_token: {threshold_token}\n"
-        f"threshold_map: {threshold_map}\n"
         f"max_fix: {max_fix}"
-        f"cache_interval: {cache_interval}"
+        f"max_interval: {max_interval}"
     )
 
     diffusion_model._tome_info = {
@@ -970,19 +933,12 @@ def apply_patch(
             "use_rand": use_rand,
             "generator": None,
 
-            "latent_size": latent_size,
-            "merge_start": merge_step[0],
-            "merge_end": merge_step[-1],
-            "cache_start": cache_start,
-            "cache_end": cache_step[-1],
+            "acc_range": (acc_start, acc_range[-1]),
             "push_unmerged": push_unmerged,
 
-            "test_skip_path": test_skip_path,
-
-            "threshold_token": threshold_token,
-            "threshold_map": threshold_map,
             "max_fix": max_fix,
-            "cache_interval": cache_interval
+            "max_interval": max_interval,
+            "test_skip_path": test_skip_path,
         }
     }
 
@@ -1002,10 +958,6 @@ def apply_patch(
             module.__class__ = make_tome_block_fn(module.__class__, mode=mode)
             module._tome_info = diffusion_model._tome_info
             module._cache = Cache(cache_bus=diffusion_model._cache_bus, index=index)
-            rand_indices = generate_semi_random_indices(module._tome_info["args"]['sy'],
-                                                        module._tome_info["args"]['sx'],
-                                                        latent_size[0], latent_size[1], steps=60)
-            module._cache.cache_bus.rand_indices[module._cache.index] = rand_indices
             index += 1
 
             # Something introduced in SD 2.0 (LDM only)
@@ -1017,7 +969,6 @@ def apply_patch(
 
 
 def remove_patch(model: torch.nn.Module):
-    """ Removes a patch from a ToMe Diffusion module if it was already patched. """
     # For diffusers
     model = model.unet if hasattr(model, "unet") else model
 
