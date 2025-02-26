@@ -2,20 +2,13 @@ import time
 import argparse
 import numpy as np
 import random
-import math
-import lpips
 
 import os
 from tqdm import tqdm
 
 import torch
 from datasets import load_dataset
-
-from torchmetrics.image.inception import InceptionScore
-from torchmetrics.multimodal.clip_score import CLIPScore
-from pytorch_fid.fid_score import calculate_fid_given_paths
 from torchvision.transforms.functional import to_pil_image
-
 from diffusers import DPMSolverMultistepScheduler, EulerDiscreteScheduler
 
 from ldm.tome import patch
@@ -74,11 +67,6 @@ def main(args):
                           max_fix=args.max_fix,
                           max_interval=args.max_interval)
 
-
-    # Initialize metric
-    inception = InceptionScore().to("cuda:0")
-    clip = CLIPScore(model_name_or_path="openai/clip-vit-base-patch16").to("cuda:0")
-
     output_dir = args.experiment_folder
     os.makedirs(output_dir, exist_ok=True)
 
@@ -111,15 +99,6 @@ def main(args):
         use_time += round(time.time() - start_time, 2)
         images = pipe_output.images
 
-
-        # Inception Score & CLIP
-        torch_images = torch.Tensor(images * 255).byte().permute(0, 3, 1, 2).contiguous()
-        torch_images = torch.nn.functional.interpolate(
-            torch_images, size=(299, 299), mode="bilinear", align_corners=False
-        ).to("cuda:0")
-        inception.update(torch_images)
-        clip.update(torch_images, sample_prompts)
-
         for image in images:
             image = to_pil_image((image * 255).astype(np.uint8))  # Convert to PIL image
             image.save(f"{output_dir}/{global_image_index}.jpg")  # Use global index
@@ -129,19 +108,6 @@ def main(args):
             patch.reset_cache(pipe)
 
     print(f"Done: use_time = {use_time}")
-    IS = inception.compute()
-    CLIP = clip.compute()
-    print(f"Inception Score: {IS}")
-    print(f"CLIP Score: {CLIP}")
-
-    fid_value = calculate_fid_given_paths(
-        [args.target_folder, args.experiment_folder],
-        1,
-        "cuda:0",
-        dims=image_size,
-        num_workers=8,
-    )
-    print(f"FID: {fid_value}")
 
 
 if __name__ == '__main__':
@@ -153,12 +119,12 @@ if __name__ == '__main__':
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num-fid-samples", type=int, default=30)
-    parser.add_argument('--experiment-folder', type=str, default='samples/inference/cap')
+    parser.add_argument('--experiment-folder', type=str, default='samples/inference/original')
     parser.add_argument('--target-folder', type=str, default='samples/data/val2017')
-    parser.add_argument("--solver", type=str, choices=["euler", "dpm"], default="euler")
+    parser.add_argument("--solver", type=str, choices=["euler", "dpm"], default="dpm")
 
     # == Acceleration Setup ==
-    parser.add_argument("--method", type=str, choices=["original", "deep_cache", "cap"], default="cap")
+    parser.add_argument("--method", type=str, choices=["original", "deep_cache", "cap"], default="original")
 
     parser.add_argument("--max-fix", type=int, default=1024 * 10)
     parser.add_argument("--max-interval", type=int, default=3)

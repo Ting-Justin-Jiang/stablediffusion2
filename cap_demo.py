@@ -92,9 +92,9 @@ def load_lora_weights(pipeline, checkpoint_path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default='stabilityai/stable-diffusion-2-1')  # model_id_v2_1 = 'stabilityai/stable-diffusion-2-1' 'stablediffusionapi/rev-animated' 'Meina/MeinaMix'
-    parser.add_argument("--prompt", type=str, default="Photograph of a cute kitty")
+    parser.add_argument("--prompt", type=str, default="Photograph of a cute panda eating a bamboo in a great bamboo forest")
     parser.add_argument("--solver", type=str, choices=["euler", "dpm"], default="dpm")
-    parser.add_argument("--seed", type=int, default=100)
+    parser.add_argument("--seed", type=int, default=3)
     parser.add_argument("--height", type=int, default=768)
     parser.add_argument("--width", type=int, default=768)
     args = parser.parse_args()

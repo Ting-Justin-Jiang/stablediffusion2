@@ -302,10 +302,11 @@ def patch_solver(solver_class):
     class PatchedDPMSolverMultistepScheduler(solver_class):
         def step(
                 self,
-                model_output: torch.FloatTensor,
-                timestep: int,
-                sample: torch.FloatTensor,
+                model_output: torch.Tensor,
+                timestep: Union[int, torch.Tensor],
+                sample: torch.Tensor,
                 generator=None,
+                variance_noise: Optional[torch.Tensor] = None,
                 return_dict: bool = True,
         ) -> Union[SchedulerOutput, Tuple]:
             if self.num_inference_steps is None:
@@ -318,7 +319,9 @@ def patch_solver(solver_class):
 
             # Improve numerical stability for small number of steps
             lower_order_final = (self.step_index == len(self.timesteps) - 1) and (
-                    self.config.euler_at_final or (self.config.lower_order_final and len(self.timesteps) < 15)
+                    self.config.euler_at_final
+                    or (self.config.lower_order_final and len(self.timesteps) < 15)
+                    or self.config.final_sigmas_type == "zero"
             )
             lower_order_second = (
                     (self.step_index == len(self.timesteps) - 2) and self.config.lower_order_final and len(
@@ -326,6 +329,8 @@ def patch_solver(solver_class):
             )
 
             # == Conduct the step skipping identified from last step == #
+            epsilon = model_output
+
             if self._cache_bus.skip_this_step and self._cache_bus.pred_m_m_1 is not None:
                 model_output = self._cache_bus.pred_m_m_1
                 self._cache_bus.skip_this_step = False
@@ -336,7 +341,8 @@ def patch_solver(solver_class):
 
             if m0.shape[-1] == 128:
                 guidance = 5.0
-            else: guidance = 7.5
+            else:
+                guidance = 7.5
 
             N = self.timesteps.shape[0]
 
@@ -360,7 +366,8 @@ def patch_solver(solver_class):
 
             delta = 1 / N  # step size correlates with number of inference step
 
-            epsilon_0 = self._cache_bus.prev_epsilon[-1][0] + guidance * (self._cache_bus.prev_epsilon[-1][1] - self._cache_bus.prev_epsilon[-1][0])
+            epsilon_0 = self._cache_bus.prev_epsilon[-1][0] + guidance * (
+                        self._cache_bus.prev_epsilon[-1][1] - self._cache_bus.prev_epsilon[-1][0])
 
             # == Criteria == #
             f = (- 0.5 * beta_n * N * sample) + (0.5 * beta_n * N / sigma_s0) * epsilon_0
@@ -369,7 +376,8 @@ def patch_solver(solver_class):
                 max_interval = self._cache_bus._tome_info['args']['max_interval']
                 acc_range = self._cache_bus._tome_info['args']['acc_range']
 
-                momentum = (self._cache_bus.prev_f[-1] - self._cache_bus.prev_f[-2]) - (self._cache_bus.prev_f[-2] - self._cache_bus.prev_f[-3])
+                momentum = (self._cache_bus.prev_f[-1] - self._cache_bus.prev_f[-2]) - (
+                            self._cache_bus.prev_f[-2] - self._cache_bus.prev_f[-3])
                 momentum_mean = momentum.mean()
                 self._cache_bus.rel_momentum_list.append((momentum_mean.item()))
 
@@ -387,13 +395,15 @@ def patch_solver(solver_class):
 
                     # CFG to the noise
                     epsilon_1 = self._cache_bus.prev_epsilon[-2][0] + guidance * (
-                                self._cache_bus.prev_epsilon[-2][1] - self._cache_bus.prev_epsilon[-2][0])
+                            self._cache_bus.prev_epsilon[-2][1] - self._cache_bus.prev_epsilon[-2][0])
 
                     # == Calculate the future data prediction in a Adam Moulton fashion ==
                     term_1 = (1 + 0.25 * delta * N * beta_n) * s_alpha_cumprod_n * m0
                     term_2 = 0.25 * delta * N * beta_n_1 * s_alpha_cumprod_n_1 * m1
-                    term_3 = ((1 + 0.25 * delta * N * beta_n) * sigma_s0 - sigma_s1 - (delta * N * beta_n) / (4 * sigma_s0)) * epsilon_0
-                    term_4 = (0.25 * delta * N * beta_n_1 * sigma_t - (delta * N * beta_n_1) / (4 * sigma_t)) * epsilon_1
+                    term_3 = ((1 + 0.25 * delta * N * beta_n) * sigma_s0 - sigma_s1 - (delta * N * beta_n) / (
+                                4 * sigma_s0)) * epsilon_0
+                    term_4 = (0.25 * delta * N * beta_n_1 * sigma_t - (delta * N * beta_n_1) / (
+                                4 * sigma_t)) * epsilon_1
 
                     m_m_1 = (term_1 + term_2 + term_3 + term_4) / s_alpha_cumprod_n_m1
 
@@ -429,20 +439,6 @@ def patch_solver(solver_class):
 
                 # Here we conduct token-wise pruning:
                 if not self._cache_bus.skip_this_step:
-                    # # == Calculate the predicted epsilon == #
-                    # # Notation: f(t) = -0.5beta(t) g^2(t) = beta(t) beta(t) = N beta_t
-                    # assert m_m_1 is not None
-                    # assert epsilon_1 is not None
-                    #
-                    # factor = (1 / (0.25 * delta * N * beta_n / sigma_s0 + sigma_t))
-                    # term_1 = - s_alpha_cumprod_n_m1 * m_m_1
-                    # term_2 = (1 - 0.5 * delta * (- 0.5 * N * beta_n)) * sample
-                    # term_3 = 0.5 * (- 0.5 * delta * N * beta_n_1) * self._cache_bus.prev_xt
-                    # term_4 = - (0.25 * delta * N * beta_n_1 / sigma_s1) * epsilon_1
-                    #
-                    # pred_epsilon = factor * (term_1 + term_2 + term_3 + term_4)
-                    # self._cache_bus.pred_epsilon = pred_epsilon
-
                     # == Define the masking on pruning
                     max_fix = self._cache_bus._tome_info['args']['max_fix']
 
@@ -474,97 +470,48 @@ def patch_solver(solver_class):
 
             self.model_outputs[-1] = model_output
 
-            noise = None
+            # Upcast to avoid precision issues when computing prev_sample
+            sample = sample.to(torch.float32)
+            if self.config.algorithm_type in ["sde-dpmsolver", "sde-dpmsolver++"] and variance_noise is None:
+                noise = randn_tensor(
+                    model_output.shape, generator=generator, device=model_output.device, dtype=torch.float32
+                )
+            elif self.config.algorithm_type in ["sde-dpmsolver", "sde-dpmsolver++"]:
+                noise = variance_noise.to(device=model_output.device, dtype=torch.float32)
+            else:
+                noise = None
 
             if self.config.solver_order == 1 or self.lower_order_nums < 1 or lower_order_final:
                 prev_sample = self.dpm_solver_first_order_update(model_output, sample=sample, noise=noise)
             elif self.config.solver_order == 2 or self.lower_order_nums < 2 or lower_order_second:
                 prev_sample = self.multistep_dpm_solver_second_order_update(self.model_outputs, sample=sample, noise=noise)
             else:
-                prev_sample = self.multistep_dpm_solver_third_order_update(self.model_outputs, sample=sample)
+                prev_sample = self.multistep_dpm_solver_third_order_update(self.model_outputs, sample=sample, noise=noise)
 
             if self.lower_order_nums < self.config.solver_order:
                 self.lower_order_nums += 1
 
+            # Cast sample back to expected dtype
+            prev_sample = prev_sample.to(model_output.dtype)
+
+            # upon completion increase step index by one
             self._step_index += 1
+
+            # # todo: this should be addressed!!
+            if self._cache_bus.skip_this_step:
+                real_m_m_1 = self.convert_model_output(epsilon, sample=prev_sample)
+                self._cache_bus.pred_m_m_1 = real_m_m_1.clone()
 
             if not return_dict:
                 return (prev_sample,)
 
             return SchedulerOutput(prev_sample=prev_sample)
 
-        def multistep_dpm_solver_second_order_update(
-                self,
-                model_output_list: List[torch.FloatTensor],
-                *args,
-                sample: torch.FloatTensor = None,
-                noise: Optional[torch.FloatTensor] = None,
-                **kwargs,
-        ) -> torch.FloatTensor:
-            if sample is None:
-                if len(args) > 2:
-                    sample = args[2]
-                else:
-                    raise ValueError(" missing `sample` as a required keyward argument")
-
-            sigma_t, sigma_s0, sigma_s1 = (
-                self.sigmas[self.step_index + 1],
-                self.sigmas[self.step_index],
-                self.sigmas[self.step_index - 1],
-            )
-
-            alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma_t)
-            alpha_s0, sigma_s0 = self._sigma_to_alpha_sigma_t(sigma_s0)
-            alpha_s1, sigma_s1 = self._sigma_to_alpha_sigma_t(sigma_s1)
-
-            lambda_t = torch.log(alpha_t) - torch.log(sigma_t)
-            lambda_s0 = torch.log(alpha_s0) - torch.log(sigma_s0)
-            lambda_s1 = torch.log(alpha_s1) - torch.log(sigma_s1)
-
-            m0, m1 = model_output_list[-1], model_output_list[-2]
-
-            h, h_0 = lambda_t - lambda_s0, lambda_s0 - lambda_s1
-            r0 = h_0 / h
-            D0, D1 = m0, (1.0 / r0) * (m0 - m1)
-            if self.config.algorithm_type == "dpmsolver++":
-                # See https://arxiv.org/abs/2211.01095 for detailed derivations
-                if self.config.solver_type == "midpoint":
-                    x_t = (
-                            (sigma_t / sigma_s0) * sample
-                            - (alpha_t * (torch.exp(-h) - 1.0)) * D0
-                            - 0.5 * (alpha_t * (torch.exp(-h) - 1.0)) * D1
-                    )
-                elif self.config.solver_type == "heun":
-                    x_t = (
-                            (sigma_t / sigma_s0) * sample
-                            - (alpha_t * (torch.exp(-h) - 1.0)) * D0
-                            + (alpha_t * ((torch.exp(-h) - 1.0) / h + 1.0)) * D1
-                    )
-                else:
-                    raise RuntimeError
-            else:
-                raise RuntimeError
-
-            # # logging 1
-            # feature_map = np.array(m0[0].unsqueeze(dim=0).cpu(), dtype=np.float32).astype(np.float16)
-            # self._cache_bus.model_outputs[self._cache_bus.c_step] = feature_map
-
-            # # logging 2
-            # if score is not None:
-            #     score = score.expand([1, 4, 96, 96])
-            #     m0 = m0 + score * 2.5
-            # feature_map = np.array(m0[0].unsqueeze(dim=0).cpu(), dtype=np.float32).astype(np.float16)
-            # self._cache_bus.model_outputs_change[self._cache_bus.c_step] = feature_map
-
-            # self._cache_bus.c_step += 1
-
-            return x_t
     if solver_class.__name__ == "EulerDiscreteScheduler":
         return PatchedEulerDiscreteScheduler
     if solver_class.__name__ == "DPMSolverMultistepScheduler":
         return PatchedDPMSolverMultistepScheduler
     else: raise NotImplementedError
-
 
 
 def make_tome_block(block_class: Type[torch.nn.Module], mode: str = 'token_merge') -> Type[torch.nn.Module]:
@@ -690,7 +637,7 @@ def patch_unet(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
                 self._cache_bus.prev_epsilon[-1] = sample
                 self._cache_bus.step += 1
 
-                return UNet2DConditionOutput(sample=torch.zeros_like(sample))
+                return UNet2DConditionOutput(sample)
 
             else:
                 default_overall_up_factor = 2 ** self.num_upsamplers
@@ -705,6 +652,14 @@ def patch_unet(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
                         forward_upsample_size = True
                         break
 
+                # ensure attention_mask is a bias, and give it a singleton query_tokens dimension
+                # expects mask of shape:
+                #   [batch, key_tokens]
+                # adds singleton query_tokens dimension:
+                #   [batch,                    1, key_tokens]
+                # this helps to broadcast it as a bias over attention scores, which will be in one of the following shapes:
+                #   [batch,  heads, query_tokens, key_tokens] (e.g. torch sdp attn)
+                #   [batch * heads, query_tokens, key_tokens] (e.g. xformers or classic attn)
                 if attention_mask is not None:
                     # assume that mask is expressed as:
                     #   (1 = keep,      0 = discard)
@@ -723,92 +678,21 @@ def patch_unet(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
                     sample = 2 * sample - 1.0
 
                 # 1. time
-                timesteps = timestep
-                if not torch.is_tensor(timesteps):
-                    # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
-                    # This would be a good case for the `match` statement (Python 3.10+)
-                    is_mps = sample.device.type == "mps"
-                    if isinstance(timestep, float):
-                        dtype = torch.float32 if is_mps else torch.float64
-                    else:
-                        dtype = torch.int32 if is_mps else torch.int64
-                    timesteps = torch.tensor([timesteps], dtype=dtype, device=sample.device)
-                elif len(timesteps.shape) == 0:
-                    timesteps = timesteps[None].to(sample.device)
-
-                # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-                timesteps = timesteps.expand(sample.shape[0])
-
-                t_emb = self.time_proj(timesteps)
-                t_emb = t_emb.to(dtype=sample.dtype)
-
+                t_emb = self.get_time_embed(sample=sample, timestep=timestep)
                 emb = self.time_embedding(t_emb, timestep_cond)
-                aug_emb = None
 
-                if self.class_embedding is not None:
-                    if class_labels is None:
-                        raise ValueError("class_labels should be provided when num_class_embeds > 0")
-
-                    if self.config.class_embed_type == "timestep":
-                        class_labels = self.time_proj(class_labels)
-
-                        # `Timesteps` does not contain any weights and will always return f32 tensors
-                        # there might be better ways to encapsulate this.
-                        class_labels = class_labels.to(dtype=sample.dtype)
-
-                    class_emb = self.class_embedding(class_labels).to(dtype=sample.dtype)
-
+                class_emb = self.get_class_embed(sample=sample, class_labels=class_labels)
+                if class_emb is not None:
                     if self.config.class_embeddings_concat:
                         emb = torch.cat([emb, class_emb], dim=-1)
                     else:
                         emb = emb + class_emb
 
-                if self.config.addition_embed_type == "text":
-                    aug_emb = self.add_embedding(encoder_hidden_states)
-                elif self.config.addition_embed_type == "text_image":
-                    # Kandinsky 2.1 - style
-                    if "image_embeds" not in added_cond_kwargs:
-                        raise ValueError(
-                            f"{self.__class__} has the config param `addition_embed_type` set to 'text_image' which requires the keyword argument `image_embeds` to be passed in `added_cond_kwargs`"
-                        )
-
-                    image_embs = added_cond_kwargs.get("image_embeds")
-                    text_embs = added_cond_kwargs.get("text_embeds", encoder_hidden_states)
-                    aug_emb = self.add_embedding(text_embs, image_embs)
-                elif self.config.addition_embed_type == "text_time":
-                    # SDXL - style
-                    if "text_embeds" not in added_cond_kwargs:
-                        raise ValueError(
-                            f"{self.__class__} has the config param `addition_embed_type` set to 'text_time' which requires the keyword argument `text_embeds` to be passed in `added_cond_kwargs`"
-                        )
-                    text_embeds = added_cond_kwargs.get("text_embeds")
-                    if "time_ids" not in added_cond_kwargs:
-                        raise ValueError(
-                            f"{self.__class__} has the config param `addition_embed_type` set to 'text_time' which requires the keyword argument `time_ids` to be passed in `added_cond_kwargs`"
-                        )
-                    time_ids = added_cond_kwargs.get("time_ids")
-                    time_embeds = self.add_time_proj(time_ids.flatten())
-                    time_embeds = time_embeds.reshape((text_embeds.shape[0], -1))
-                    add_embeds = torch.concat([text_embeds, time_embeds], dim=-1)
-                    add_embeds = add_embeds.to(emb.dtype)
-                    aug_emb = self.add_embedding(add_embeds)
-                elif self.config.addition_embed_type == "image":
-                    # Kandinsky 2.2 - style
-                    if "image_embeds" not in added_cond_kwargs:
-                        raise ValueError(
-                            f"{self.__class__} has the config param `addition_embed_type` set to 'image' which requires the keyword argument `image_embeds` to be passed in `added_cond_kwargs`"
-                        )
-                    image_embs = added_cond_kwargs.get("image_embeds")
-                    aug_emb = self.add_embedding(image_embs)
-                elif self.config.addition_embed_type == "image_hint":
-                    # Kandinsky 2.2 - style
-                    if "image_embeds" not in added_cond_kwargs or "hint" not in added_cond_kwargs:
-                        raise ValueError(
-                            f"{self.__class__} has the config param `addition_embed_type` set to 'image_hint' which requires the keyword arguments `image_embeds` and `hint` to be passed in `added_cond_kwargs`"
-                        )
-                    image_embs = added_cond_kwargs.get("image_embeds")
-                    hint = added_cond_kwargs.get("hint")
-                    aug_emb, hint = self.add_embedding(image_embs, hint)
+                aug_emb = self.get_aug_embed(
+                    emb=emb, encoder_hidden_states=encoder_hidden_states, added_cond_kwargs=added_cond_kwargs
+                )
+                if self.config.addition_embed_type == "image_hint":
+                    aug_emb, hint = aug_emb
                     sample = torch.cat([sample, hint], dim=1)
 
                 emb = emb + aug_emb if aug_emb is not None else emb
@@ -816,33 +700,9 @@ def patch_unet(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
                 if self.time_embed_act is not None:
                     emb = self.time_embed_act(emb)
 
-                if self.encoder_hid_proj is not None and self.config.encoder_hid_dim_type == "text_proj":
-                    encoder_hidden_states = self.encoder_hid_proj(encoder_hidden_states)
-                elif self.encoder_hid_proj is not None and self.config.encoder_hid_dim_type == "text_image_proj":
-                    # Kadinsky 2.1 - style
-                    if "image_embeds" not in added_cond_kwargs:
-                        raise ValueError(
-                            f"{self.__class__} has the config param `encoder_hid_dim_type` set to 'text_image_proj' which requires the keyword argument `image_embeds` to be passed in  `added_conditions`"
-                        )
-
-                    image_embeds = added_cond_kwargs.get("image_embeds")
-                    encoder_hidden_states = self.encoder_hid_proj(encoder_hidden_states, image_embeds)
-                elif self.encoder_hid_proj is not None and self.config.encoder_hid_dim_type == "image_proj":
-                    # Kandinsky 2.2 - style
-                    if "image_embeds" not in added_cond_kwargs:
-                        raise ValueError(
-                            f"{self.__class__} has the config param `encoder_hid_dim_type` set to 'image_proj' which requires the keyword argument `image_embeds` to be passed in  `added_conditions`"
-                        )
-                    image_embeds = added_cond_kwargs.get("image_embeds")
-                    encoder_hidden_states = self.encoder_hid_proj(image_embeds)
-                elif self.encoder_hid_proj is not None and self.config.encoder_hid_dim_type == "ip_image_proj":
-                    if "image_embeds" not in added_cond_kwargs:
-                        raise ValueError(
-                            f"{self.__class__} has the config param `encoder_hid_dim_type` set to 'ip_image_proj' which requires the keyword argument `image_embeds` to be passed in  `added_conditions`"
-                        )
-                    image_embeds = added_cond_kwargs.get("image_embeds")
-                    image_embeds = self.encoder_hid_proj(image_embeds).to(encoder_hidden_states.dtype)
-                    encoder_hidden_states = torch.cat([encoder_hidden_states, image_embeds], dim=1)
+                encoder_hidden_states = self.process_encoder_hidden_states(
+                    encoder_hidden_states=encoder_hidden_states, added_cond_kwargs=added_cond_kwargs
+                )
 
                 # 2. pre-process
                 sample = self.conv_in(sample)
@@ -854,7 +714,14 @@ def patch_unet(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
                     cross_attention_kwargs["gligen"] = {"objs": self.position_net(**gligen_args)}
 
                 # 3. down
-                lora_scale = cross_attention_kwargs.get("scale", 1.0) if cross_attention_kwargs is not None else 1.0
+                # we're popping the `scale` instead of getting it because otherwise `scale` will be propagated
+                # to the internal blocks and will raise deprecation warnings. this will be confusing for our users.
+                if cross_attention_kwargs is not None:
+                    cross_attention_kwargs = cross_attention_kwargs.copy()
+                    lora_scale = cross_attention_kwargs.pop("scale", 1.0)
+                else:
+                    lora_scale = 1.0
+
                 if USE_PEFT_BACKEND:
                     # weight the lora layers by setting `lora_scale` for each PEFT layer
                     scale_lora_layers(self, lora_scale)
@@ -887,7 +754,7 @@ def patch_unet(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
                             **additional_residuals,
                         )
                     else:
-                        sample, res_samples = downsample_block(hidden_states=sample, temb=emb, scale=lora_scale)
+                        sample, res_samples = downsample_block(hidden_states=sample, temb=emb)
                         if is_adapter and len(down_intrablock_additional_residuals) > 0:
                             sample += down_intrablock_additional_residuals.pop(0)
 
@@ -958,7 +825,6 @@ def patch_unet(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
                             temb=emb,
                             res_hidden_states_tuple=res_samples,
                             upsample_size=upsample_size,
-                            scale=lora_scale,
                         )
 
                 # 6. post-process

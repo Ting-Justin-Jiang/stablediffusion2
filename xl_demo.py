@@ -28,6 +28,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
+    lora_path = "/home/tj147/SD2/checkpoints/frieren_nereirfpnxl_xl.safetensors"
     seed = args.seed
     prompt = args.prompt
 
@@ -38,6 +39,7 @@ if __name__ == "__main__":
         baseline_pipe.scheduler = DPMSolverMultistepScheduler.from_config(baseline_pipe.scheduler.config)
     if args.solver == "euler":
         baseline_pipe.scheduler = EulerDiscreteScheduler.from_config(baseline_pipe.scheduler.config)
+    # baseline_pipe.load_lora_weights(lora_path)
 
     # Warmup GPU. Only for testing the speed.
     logging.info("Warming up GPU...")
@@ -65,6 +67,7 @@ if __name__ == "__main__":
         pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
     if args.solver == "euler":
         pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
+    # pipe.load_lora_weights(lora_path)
 
 
     patch.apply_patch(pipe,
